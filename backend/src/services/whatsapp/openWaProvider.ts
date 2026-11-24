@@ -1,0 +1,581 @@
+import { env } from '../../config/env.js';
+import {
+  WhatsAppSender,
+  SendMessageParams,
+  SendDocumentParams,
+  SendMessageResult,
+  WhatsAppDeviceStatus,
+} from './whatsappProvider.interface.js';
+import { isBlockedOrDummyNumber } from './queue.service.js';
+
+/**
+ * OpenWaProvider
+ * 
+ * Official OpenWA REST API Gateway Provider.
+ * Communicates directly with the OpenWA NestJS API running on http://127.0.0.1:2785.
+ */
+export class OpenWaProvider implements WhatsAppSender {
+  readonly name = 'OPENWA' as const;
+  private cachedSessionId: string | null = null;
+  private cachedSessionInfo: any = null;
+  private lastStatusResult: { data: WhatsAppDeviceStatus; timestamp: number } | null = null;
+  private lastQrCode: string | null = null;
+  private isConnectingMutex: boolean = false;
+
+  private getBaseUrl(): string {
+    return (env.OPENWA_API_URL || process.env.OPENWA_API_URL || env.WHATSAPP_LINKED_DEVICE_URL || '').replace(/\/+$/, '');
+  }
+
+  private getApiKey(): string {
+    return (
+      env.OPENWA_API_KEY ||
+      process.env.OPENWA_API_KEY ||
+      env.WHATSAPP_LINKED_DEVICE_TOKEN ||
+      ''
+    );
+  }
+
+  private getHeaders(): Record<string, string> {
+    const key = this.getApiKey();
+    return {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'x-api-key': key,
+      Authorization: `Bearer ${key}`,
+    };
+  }
+
+  private formatChatId(phone: string): string {
+    let digits = phone.replace(/\D/g, '');
+    if (digits.length === 10) {
+      digits = `91${digits}`;
+    } else if (digits.length === 11 && digits.startsWith('0')) {
+      digits = `91${digits.slice(1)}`;
+    }
+    return digits.includes('@') ? digits : `${digits}@c.us`;
+  }
+
+  isConfigured(): boolean {
+    return Boolean(this.getBaseUrl() && this.getApiKey());
+  }
+
+  /**
+   * Resolves or creates an active session in OpenWA
+   */
+  async getActiveSession(): Promise<{ id: string; name: string; phone?: string; status: string } | null> {
+    const baseUrl = this.getBaseUrl();
+    try {
+      const res = await fetch(`${baseUrl}/api/sessions`, {
+        headers: this.getHeaders(),
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (res.status === 429) {
+        console.warn('[OpenWA] Throttled (429) on /api/sessions, using cached session:', this.cachedSessionId);
+        if (this.cachedSessionInfo) {
+          return this.cachedSessionInfo;
+        }
+      }
+
+      if (!res.ok) {
+        return this.cachedSessionInfo || null;
+      }
+
+      const sessions = (await res.json()) as any[];
+      if (Array.isArray(sessions) && sessions.length > 0) {
+        const readySession = sessions.find((s) => s.status === 'ready') || sessions[0];
+        this.cachedSessionId = readySession.id;
+        this.cachedSessionInfo = readySession;
+        return readySession;
+      }
+
+      // Auto-create session if none exists
+      const createRes = await fetch(`${baseUrl}/api/sessions`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify({ name: 'amit-academy-session' }),
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (createRes.ok) {
+        const created = (await createRes.json()) as any;
+        const sessionId = created.id || created.sessionId;
+        this.cachedSessionId = sessionId;
+        this.cachedSessionInfo = created;
+        try {
+          await fetch(`${baseUrl}/api/sessions/${sessionId}/start`, {
+            method: 'POST',
+            headers: this.getHeaders(),
+            body: JSON.stringify({}),
+            signal: AbortSignal.timeout(8000),
+          });
+        } catch {}
+        return created;
+      }
+
+      return this.cachedSessionInfo || null;
+    } catch (err: any) {
+      console.warn('[OpenWA] Failed to query/create session in OpenWA:', err.message);
+      return this.cachedSessionInfo || null;
+    }
+  }
+
+  /**
+   * Fetch QR code from OpenWA for a session
+   */
+  async getQrCode(sessionId: string): Promise<string | null> {
+    const baseUrl = this.getBaseUrl();
+    try {
+      const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/qr`, {
+        headers: this.getHeaders(),
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (res.status === 429) {
+        return this.lastQrCode;
+      }
+
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        if (data.qrCode) {
+          this.lastQrCode = data.qrCode;
+        }
+        return data.qrCode || this.lastQrCode || null;
+      }
+      return this.lastQrCode || null;
+    } catch {
+      return this.lastQrCode || null;
+    }
+  }
+
+  async getStatus(): Promise<WhatsAppDeviceStatus> {
+    // 3-second cache to prevent throttling
+    if (this.lastStatusResult && (Date.now() - this.lastStatusResult.timestamp < 3000)) {
+      return this.lastStatusResult.data;
+    }
+
+    const baseUrl = this.getBaseUrl();
+    const session = await this.getActiveSession();
+
+    if (!session) {
+      const fallback: WhatsAppDeviceStatus = {
+        status: 'DISCONNECTED',
+        providerName: 'OpenWA REST API Gateway',
+        isConfigured: this.isConfigured(),
+        sessionStatus: 'Connecting to OpenWA gateway',
+        details: `Connecting to OpenWA at ${baseUrl}`,
+      };
+      return fallback;
+    }
+
+    const isConnected = session.status === 'ready';
+    let qrCode: string | undefined = undefined;
+
+    if (!isConnected) {
+      // Check if QR code is ready in OpenWA (Pure read-only query - NEVER trigger /start on read polls)
+      const fetchedQr = await this.getQrCode(session.id);
+      if (fetchedQr) {
+        qrCode = fetchedQr;
+        this.lastQrCode = fetchedQr;
+      } else if (this.lastQrCode) {
+        qrCode = this.lastQrCode;
+      }
+    }
+
+    const effectiveQr = isConnected ? undefined : (qrCode || this.lastQrCode || undefined);
+    const sessionPhone = session.phone ? String(session.phone).replace(/\D/g, '') : '';
+    const hasValidPhone = sessionPhone.length >= 10 && !sessionPhone.includes('9999999999');
+    
+    // In Baileys / OpenWA, session.status === 'ready' signifies an active, authenticated companion socket.
+    // session.phone may be temporarily null or unresolved during LID sync. Never demote a live socket!
+    const isReallyConnected = session.status === 'ready';
+    const formattedPhone = hasValidPhone
+      ? `+${sessionPhone}`
+      : session.phone
+      ? String(session.phone)
+      : isReallyConnected
+      ? ((session as any).pushName ? `${(session as any).pushName} (Active)` : '+91 (Active Companion)')
+      : undefined;
+
+    const deviceStatus: WhatsAppDeviceStatus = {
+      status: isReallyConnected ? 'CONNECTED' : effectiveQr ? 'QR_READY' : 'CONNECTING',
+      phoneNumber: formattedPhone,
+      providerName: `OpenWA Gateway (${session.name || 'gurukul'})`,
+      isConfigured: true,
+      qrCode: isReallyConnected ? undefined : effectiveQr,
+      sessionStatus: `Session ${session.name} is ${session.status}`,
+      details: isReallyConnected ? `Active on ${baseUrl} via ${formattedPhone}` : `Waiting for WhatsApp companion scan on ${baseUrl}`,
+    };
+
+    this.lastStatusResult = {
+      data: deviceStatus,
+      timestamp: Date.now(),
+    };
+
+    return deviceStatus;
+  }
+
+  async connect(): Promise<{ success: boolean; message: string; qrCode?: string; status: WhatsAppDeviceStatus }> {
+    if (this.isConnectingMutex) {
+      console.log('[OpenWA] Connect mutex locked: another connection attempt is in progress. Returning current status.');
+      const currentStatus = await this.getStatus();
+      return {
+        success: true,
+        message: 'Connection initialization in progress...',
+        qrCode: currentStatus.qrCode,
+        status: currentStatus,
+      };
+    }
+
+    this.isConnectingMutex = true;
+    try {
+      this.lastStatusResult = null; // Bust cache for explicit connect
+      const baseUrl = this.getBaseUrl();
+      const session = await this.getActiveSession();
+
+      if (!session) {
+        return {
+          success: false,
+          message: 'Could not initialize session on OpenWA gateway',
+          status: {
+            status: 'DISCONNECTED',
+            providerName: 'OpenWA REST API Gateway',
+            isConfigured: false,
+          },
+        };
+      }
+
+      // CRITICAL FIX: If session is already 'ready' / connected, DO NOT call /start!
+      // In OpenWA / Baileys, calling /start on an active session forcibly tears down the live WebSocket
+      // and logs out the linked companion device!
+      if (session.status === 'ready') {
+        console.log(`[OpenWA] Session ${session.id} is already in 'ready' status. Preserving active socket.`);
+        this.lastStatusResult = null;
+        const currentStatus = await this.getStatus();
+        return {
+          success: true,
+          message: 'WhatsApp session is already connected and active!',
+          status: currentStatus,
+        };
+      }
+
+      // 1. Start the session in OpenWA only if not already starting or ready
+      if (session.status !== 'starting') {
+        try {
+          await fetch(`${baseUrl}/api/sessions/${session.id}/start`, {
+            method: 'POST',
+            headers: this.getHeaders(),
+            body: JSON.stringify({}),
+            signal: AbortSignal.timeout(8000),
+          });
+        } catch (e: any) {
+          console.warn('[OpenWA] Session start request note:', e.message);
+        }
+      }
+
+      // 2. Poll for QR code (up to 8 seconds to allow Render bridge to generate QR)
+      let qrCode: string | null = null;
+      for (let i = 0; i < 8; i++) {
+        qrCode = await this.getQrCode(session.id);
+        if (qrCode) break;
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+
+      if (qrCode) {
+        this.lastQrCode = qrCode;
+      }
+
+      this.lastStatusResult = null;
+      const status = await this.getStatus();
+      const finalQr = qrCode || this.lastQrCode || status.qrCode;
+      if (finalQr && status.status !== 'CONNECTED') {
+        status.qrCode = finalQr;
+        status.status = 'QR_READY';
+        this.lastStatusResult = {
+          data: status,
+          timestamp: Date.now(),
+        };
+      }
+
+      return {
+        success: true,
+        message: finalQr
+          ? 'Fresh QR code generated! Scan via WhatsApp on your phone.'
+          : 'Session starting in background. QR code will appear momentarily.',
+        qrCode: finalQr || undefined,
+        status,
+      };
+    } finally {
+      this.isConnectingMutex = false;
+    }
+  }
+
+  async disconnect(): Promise<{ success: boolean; message: string; status: WhatsAppDeviceStatus }> {
+    this.lastStatusResult = null;
+    this.lastQrCode = null;
+    this.cachedSessionId = null;
+    this.cachedSessionInfo = null;
+    const baseUrl = this.getBaseUrl();
+
+    try {
+      // 1. Fetch all existing sessions from OpenWA gateway
+      const res = await fetch(`${baseUrl}/api/sessions`, {
+        headers: this.getHeaders(),
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (res.ok) {
+        const sessions = (await res.json()) as any[];
+        if (Array.isArray(sessions) && sessions.length > 0) {
+          for (const s of sessions) {
+            // A. Attempt logout
+            try {
+              await fetch(`${baseUrl}/api/sessions/${s.id}/logout`, {
+                method: 'POST',
+                headers: this.getHeaders(),
+                body: JSON.stringify({}),
+                signal: AbortSignal.timeout(5000),
+              });
+            } catch (loErr: any) {
+              console.warn(`[OpenWA] Logout notice for session ${s.id}:`, loErr.message);
+            }
+
+            // B. Attempt stop
+            try {
+              await fetch(`${baseUrl}/api/sessions/${s.id}/stop`, {
+                method: 'POST',
+                headers: this.getHeaders(),
+                body: JSON.stringify({}),
+                signal: AbortSignal.timeout(5000),
+              });
+            } catch (stErr: any) {
+              console.warn(`[OpenWA] Stop notice for session ${s.id}:`, stErr.message);
+            }
+
+            // C. CRITICAL ROOT CAUSE FIX: Hard-delete session from bridge!
+            // In OpenWA, DELETE /api/sessions/:id purges the session folder, SQLite auth credentials,
+            // and cryptographic keys. Without this, starting a session reuses the previous user's credentials!
+            try {
+              const delRes = await fetch(`${baseUrl}/api/sessions/${s.id}`, {
+                method: 'DELETE',
+                headers: this.getHeaders(),
+                signal: AbortSignal.timeout(8000),
+              });
+              console.log(`[OpenWA] Hard-deleted session ${s.id}: HTTP ${delRes.status}`);
+            } catch (delErr: any) {
+              console.warn(`[OpenWA] Failed to hard-delete session ${s.id}:`, delErr.message);
+            }
+          }
+        }
+      }
+    } catch (err: any) {
+      console.warn('[OpenWA] Disconnect error:', err.message);
+    }
+
+    this.cachedSessionId = null;
+    this.cachedSessionInfo = null;
+    this.lastStatusResult = null;
+    this.lastQrCode = null;
+
+    const status: WhatsAppDeviceStatus = {
+      status: 'DISCONNECTED',
+      providerName: 'OpenWA REST API Gateway',
+      isConfigured: this.isConfigured(),
+      sessionStatus: 'Session deleted and unlinked cleanly',
+      details: 'Previous WhatsApp session completely removed. Ready for new client QR scan.',
+    };
+
+    return {
+      success: true,
+      message: 'WhatsApp session deleted and unlinked successfully',
+      status,
+    };
+  }
+
+  async reconnect(): Promise<{ success: boolean; message: string; qrCode?: string; status: WhatsAppDeviceStatus }> {
+    const session = await this.getActiveSession();
+    if (session && session.status === 'ready') {
+      const currentStatus = await this.getStatus();
+      return {
+        success: true,
+        message: 'WhatsApp session is already connected and active!',
+        status: currentStatus,
+      };
+    }
+    return this.connect();
+  }
+
+  async sendMessage(params: SendMessageParams): Promise<SendMessageResult> {
+    if (isBlockedOrDummyNumber(params.to)) {
+      return {
+        success: false,
+        provider: 'OPENWA',
+        status: 'FAILED',
+        errorMessage: `Blocked delivery: ${params.to} is a dummy/test number. Live dispatch cancelled to protect real subscribers.`,
+      };
+    }
+
+    const baseUrl = this.getBaseUrl();
+    const session = await this.getActiveSession();
+
+    if (!session) {
+      return {
+        success: false,
+        provider: 'OPENWA',
+        status: 'FAILED',
+        errorMessage: 'No active OpenWA session found on gateway',
+      };
+    }
+
+    const chatId = this.formatChatId(params.to);
+    const text = params.body;
+    const sendUrl = `${baseUrl}/api/sessions/${session.id}/messages/send-text`;
+
+    console.log(`[OpenWA] Dispatching message to ${chatId} using session ${session.id} (${session.name})`);
+
+    // Anti-Ban Humanization: Simulate 0.8s - 1.4s of typing presence before dispatch
+    try {
+      await fetch(`${baseUrl}/api/sessions/${session.id}/chats/send-state`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify({ chatId, state: 'typing' }),
+        signal: AbortSignal.timeout(3000),
+      }).catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 800 + Math.floor(Math.random() * 600)));
+    } catch {}
+
+    try {
+      const res = await fetch(sendUrl, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify({
+          chatId,
+          text,
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (res.ok) {
+        const data = (await res.json().catch(() => ({}))) as any;
+        console.log(`[OpenWA] Successfully sent message to ${chatId}:`, data);
+        return {
+          success: true,
+          provider: 'OPENWA',
+          messageId: data.messageId || `openwa_${Date.now()}`,
+          status: 'SENT',
+        };
+      }
+
+      const errorText = await res.text().catch(() => '');
+      console.error(`[OpenWA] Send failed with HTTP ${res.status}:`, errorText);
+      return {
+        success: false,
+        provider: 'OPENWA',
+        status: 'FAILED',
+        errorMessage: `OpenWA HTTP ${res.status}: ${errorText}`,
+      };
+    } catch (err: any) {
+      console.error(`[OpenWA] Error sending message to ${chatId}:`, err.message);
+      return {
+        success: false,
+        provider: 'OPENWA',
+        status: 'FAILED',
+        errorMessage: err.message,
+      };
+    }
+  }
+
+  async sendDocument(params: SendDocumentParams): Promise<SendMessageResult> {
+    if (isBlockedOrDummyNumber(params.to)) {
+      return {
+        success: false,
+        provider: 'OPENWA',
+        status: 'FAILED',
+        errorMessage: `Blocked delivery: ${params.to} is a dummy/test number. Live dispatch cancelled to protect real subscribers.`,
+      };
+    }
+
+    const baseUrl = this.getBaseUrl();
+    const session = await this.getActiveSession();
+
+    if (!session) {
+      return {
+        success: false,
+        provider: 'OPENWA',
+        status: 'FAILED',
+        errorMessage: 'No active OpenWA session found on gateway',
+      };
+    }
+
+    const chatId = this.formatChatId(params.to);
+    const sendUrl = `${baseUrl}/api/sessions/${session.id}/messages/send-document`;
+
+    console.log(`[OpenWA] Dispatching document (${params.fileName}) to ${chatId} using session ${session.id}`);
+
+    // Anti-Ban Humanization: brief typing presence
+    try {
+      await fetch(`${baseUrl}/api/sessions/${session.id}/chats/send-state`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify({ chatId, state: 'typing' }),
+        signal: AbortSignal.timeout(3000),
+      }).catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 800 + Math.floor(Math.random() * 600)));
+    } catch {}
+
+    try {
+      const payload = {
+        chatId,
+        base64: params.documentBase64,
+        filename: params.fileName,
+        mimetype: params.mimetype || 'application/pdf',
+        caption: params.caption || '',
+      };
+
+      const res = await fetch(sendUrl, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(30000),
+      });
+
+      if (res.ok) {
+        const data = (await res.json().catch(() => ({}))) as any;
+        console.log(`[OpenWA] Successfully sent document to ${chatId}:`, data);
+        return {
+          success: true,
+          provider: 'OPENWA',
+          messageId: data.messageId || `openwa_doc_${Date.now()}`,
+          status: 'SENT',
+        };
+      }
+
+      const errorText = await res.text().catch(() => '');
+      console.error(`[OpenWA] Document send failed with HTTP ${res.status}:`, errorText);
+      return {
+        success: false,
+        provider: 'OPENWA',
+        status: 'FAILED',
+        errorMessage: `OpenWA HTTP ${res.status}: ${errorText}`,
+      };
+    } catch (err: any) {
+      console.error(`[OpenWA] Error sending document to ${chatId}:`, err.message);
+      return {
+        success: false,
+        provider: 'OPENWA',
+        status: 'FAILED',
+        errorMessage: err.message,
+      };
+    }
+  }
+
+  async healthCheck(): Promise<{ healthy: boolean; details?: string }> {
+    const status = await this.getStatus();
+    return {
+      healthy: status.status === 'CONNECTED',
+      details: status.details,
+    };
+  }
+}
+
+export const openWaProvider = new OpenWaProvider();

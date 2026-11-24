@@ -1,0 +1,2244 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { Link } from 'react-router-dom';
+import {
+  CreditCard,
+  Plus,
+  Search,
+  CheckCircle2,
+  AlertCircle,
+  Clock,
+  DollarSign,
+  Banknote,
+  MessageSquare,
+  Edit2,
+  Trash2,
+  BookOpen,
+  RotateCcw,
+  Check,
+  QrCode,
+  Send,
+  Printer,
+  ArrowRight,
+  Receipt,
+} from 'lucide-react';
+import { useAuth } from '../../contexts/AuthContext';
+import { useToast } from '../../contexts/ToastContext';
+import { FeePlan, StudentFee } from '../../types/fee';
+import { Button } from '../../components/ui/Button';
+import { Card } from '../../components/ui/Card';
+import { Modal } from '../../components/ui/Modal';
+import { Input } from '../../components/ui/Input';
+import { Select } from '../../components/ui/Select';
+import { SkeletonLoader } from '../../components/common/SkeletonLoader';
+import { EmptyState } from '../../components/common/EmptyState';
+import { StatusBadge } from '../../components/common/StatusBadge';
+import { FeeReminderPipelineGraph } from '../../components/fees/FeeReminderPipelineGraph';
+import { API_BASE, authFetch } from '../../lib/api';
+
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'
+];
+
+export function formatBillingPeriod(periodStr: string): string {
+  if (!periodStr) return '';
+  if (periodStr.includes('_YEARLY')) {
+    const year = periodStr.split('-')[0];
+    const nextYear = parseInt(year, 10) + 1;
+    return `Annual Package (${year} - ${isNaN(nextYear) ? '2027' : nextYear})`;
+  }
+  if (periodStr.includes('_INST_')) {
+    const instNum = periodStr.split('_INST_')[1];
+    return `Scheduled Installment #${instNum}`;
+  }
+  if (!periodStr.includes('-')) return periodStr;
+  const [year, month] = periodStr.split('-');
+  const monthIdx = parseInt(month, 10) - 1;
+  if (monthIdx >= 0 && monthIdx < 12) {
+    return `${MONTH_NAMES[monthIdx]} ${year}`;
+  }
+  return periodStr;
+}
+
+const generateMonthlyPeriodOptions = () => {
+  const options: Array<{ value: string; label: string }> = [];
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  for (let year = currentYear - 1; year <= currentYear + 1; year++) {
+    for (let m = 1; m <= 12; m++) {
+      const val = `${year}-${String(m).padStart(2, '0')}`;
+      const label = `${MONTH_NAMES[m - 1]} ${year}`;
+      options.push({ value: val, label });
+    }
+  }
+  return options;
+};
+
+const monthlyPeriodOptions = generateMonthlyPeriodOptions();
+
+export const FeesPage: React.FC = () => {
+  const { token } = useAuth();
+  const { toast } = useToast();
+  const [activeTab, setActiveTab] = useState<'student_fees' | 'fee_plans'>('student_fees');
+  const [studentFees, setStudentFees] = useState<StudentFee[]>([]);
+  const [feePlans, setFeePlans] = useState<FeePlan[]>([]);
+  const [students, setStudents] = useState<any[]>([]);
+  const [paymentsList, setPaymentsList] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Student Delete from Fees state
+  const [studentToDeleteFromFees, setStudentToDeleteFromFees] = useState<{ id: string; name: string } | null>(null);
+  const [deletingStudentFromFees, setDeletingStudentFromFees] = useState(false);
+
+  // Filters
+  const [searchQuery, setSearchQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState('ALL');
+
+  // Modals
+  const [isPlanModalOpen, setIsPlanModalOpen] = useState(false);
+  const [isEditPlanModalOpen, setIsEditPlanModalOpen] = useState(false);
+  const [editingPlan, setEditingPlan] = useState<FeePlan | null>(null);
+  const [editPlanForm, setEditPlanForm] = useState({
+    name: '',
+    amount: '',
+    frequency: 'MONTHLY',
+    dueDay: '5',
+  });
+  const [isAssignModalOpen, setIsAssignModalOpen] = useState(false);
+  const [isPayModalOpen, setIsPayModalOpen] = useState(false);
+  const [selectedFee, setSelectedFee] = useState<StudentFee | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [modalSuccessMessage, setModalSuccessMessage] = useState<string | null>(null);
+  const [sendingReminderId, setSendingReminderId] = useState<string | null>(null);
+  const [triggeringMonthly, setTriggeringMonthly] = useState(false);
+  const [reminderSuccessMessage, setReminderSuccessMessage] = useState<string | null>(null);
+
+  // WhatsApp Fee Reminder Template & Rules
+  const DEFAULT_FEE_TEMPLATE =
+    'Namaste {parent_name}! 🙏 Reminder from Amit Academy: Fee dues for {student_name} ({course}) is ₹{pending_amount}, scheduled due date: {due_date}. Kindly clear the dues at academy counter or contact Sensei. Thank you!\n- Amit Academy';
+
+  const [feeWhatsappTemplate, setFeeWhatsappTemplate] = useState<string>(() => {
+    try {
+      return localStorage.getItem('gurukul_whatsapp_fee_template') || DEFAULT_FEE_TEMPLATE;
+    } catch {
+      return DEFAULT_FEE_TEMPLATE;
+    }
+  });
+
+  const [isFeeTemplateOpen, setIsFeeTemplateOpen] = useState(false);
+  const templateTextareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const handleInsertTagAtCursor = (tag: string) => {
+    const textarea = templateTextareaRef.current;
+    if (!textarea) {
+      setFeeWhatsappTemplate((prev) => `${prev} ${tag}`);
+      return;
+    }
+    const currentVal = textarea.value;
+    const start = textarea.selectionStart ?? currentVal.length;
+    const end = textarea.selectionEnd ?? currentVal.length;
+    const before = currentVal.substring(0, start);
+    const after = currentVal.substring(end);
+    const updated = `${before}${tag}${after}`;
+    setFeeWhatsappTemplate(updated);
+    setTimeout(() => {
+      textarea.focus();
+      const newPos = start + tag.length;
+      textarea.setSelectionRange(newPos, newPos);
+    }, 0);
+  };
+  const [reminderRules, setReminderRules] = useState(() => {
+    try {
+      const saved = localStorage.getItem('gurukul_fee_reminder_rules');
+      return saved
+        ? JSON.parse(saved)
+        : {
+            fiveDaysBefore: true,
+            twoDaysBefore: true,
+            onDueDate: true,
+            twoDaysAfter: true,
+            fourDaysAfter: true,
+            graceDays: 2,
+            lateFeeRate: 50,
+          };
+    } catch {
+      return {
+        fiveDaysBefore: true,
+        twoDaysBefore: true,
+        onDueDate: true,
+        twoDaysAfter: true,
+        fourDaysAfter: true,
+        graceDays: 2,
+        lateFeeRate: 50,
+      };
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('gurukul_fee_reminder_rules', JSON.stringify(reminderRules));
+    } catch {}
+  }, [reminderRules]);
+
+  const [undoingFeeId, setUndoingFeeId] = useState<string | null>(null);
+
+  const handleUndoPayment = async (fee: StudentFee) => {
+    if (!token) return;
+    const studentName = fee.student?.name || 'student';
+    const amountToUndo = Number(fee.amount_paid || fee.amount_due || 0);
+    const confirmUndo = window.confirm(
+      `Undo / Revert payment for ${studentName}? This will cancel the accidental payment of ₹${amountToUndo.toLocaleString('en-IN')} and restore the pending balance.`
+    );
+    if (!confirmUndo) return;
+
+    setUndoingFeeId(fee.id);
+    setError(null);
+    try {
+      const targetIdentifier = fee.id || fee.student_id;
+      const res = await authFetch(`${API_BASE}/payments/revert-fee/${targetIdentifier}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || data.message || 'Failed to revert payment');
+
+      // Optimistic update: mark latest payment refunded and restore fee row balance immediately
+      setPaymentsList((prev) => {
+        let refundedOnce = false;
+        return prev.map((p) => {
+          if (!refundedOnce && (p.student_fee_id === fee.id || p.student_id === fee.student_id) && p.status === 'SUCCESS') {
+            refundedOnce = true;
+            return { ...p, status: 'REFUNDED' };
+          }
+          return p;
+        });
+      });
+
+      setStudentFees((prev) =>
+        prev.map((f) => {
+          if (f.id === fee.id) {
+            const restoredPending = Number(f.amount_due || 0);
+            return {
+              ...f,
+              amount_paid: 0,
+              pending_amount: restoredPending,
+              status: 'OVERDUE' as any,
+            };
+          }
+          return f;
+        })
+      );
+
+      setReminderSuccessMessage(`✓ Payment reverted! Balance for ${studentName} has been restored.`);
+      setTimeout(() => setReminderSuccessMessage(null), 4000);
+      await fetchData();
+    } catch (err: any) {
+      setError(err.message || 'Error reverting payment');
+    } finally {
+      setUndoingFeeId(null);
+    }
+  };
+
+  // Adjust Student Fee Modal state
+  const [isAdjustFeeModalOpen, setIsAdjustFeeModalOpen] = useState(false);
+  const [adjustingFee, setAdjustingFee] = useState<{
+    id: string;
+    studentName: string;
+    amountDue: string;
+    dueDate: string;
+  } | null>(null);
+  const [adjustingLoading, setAdjustingLoading] = useState(false);
+
+  // Form states
+  const [planForm, setPlanForm] = useState({
+    name: '',
+    amount: '',
+    frequency: 'MONTHLY',
+    dueDay: '10',
+  });
+
+  const [assignForm, setAssignForm] = useState({
+    studentId: '',
+    feePlanId: '',
+    billingPeriod: `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`,
+    amountDue: '',
+    dueDate: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 10).toISOString().split('T')[0],
+  });
+
+  const [payForm, setPayForm] = useState({
+    amount: '',
+    paymentMethod: 'CASH',
+    provider: 'MANUAL',
+    notes: 'Cash payment received at front desk',
+    nextDueDate: '',
+    paymentDate: new Date().toISOString().split('T')[0],
+  });
+
+  // Fetch data
+  const fetchData = async () => {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const headers = { Authorization: `Bearer ${token}` };
+
+      const [feesRes, plansRes, studentsRes, paymentsRes] = await Promise.all([
+        authFetch(`${API_BASE}/fees/students`, { headers }),
+        authFetch(`${API_BASE}/fees/plans`, { headers }),
+        authFetch(`${API_BASE}/students?status=ACTIVE`, { headers }),
+        authFetch(`${API_BASE}/payments`, { headers }).catch(() => null),
+      ]);
+
+      const feesData = await feesRes.json();
+      const plansData = await plansRes.json();
+      const studentsData = await studentsRes.json();
+
+      if (feesData.success && Array.isArray(feesData.data)) setStudentFees(feesData.data);
+      if (plansData.success && Array.isArray(plansData.data)) setFeePlans(plansData.data);
+      if (studentsData.success && Array.isArray(studentsData.data)) setStudents(studentsData.data);
+      if (paymentsRes && paymentsRes.ok) {
+        const paymentsData = await paymentsRes.json().catch(() => null);
+        if (paymentsData?.success && Array.isArray(paymentsData.data)) {
+          setPaymentsList(paymentsData.data);
+        } else if (Array.isArray(paymentsData)) {
+          setPaymentsList(paymentsData);
+        }
+      }
+
+      // Sync active fee reminder template from database
+      authFetch(`${API_BASE}/whatsapp/templates?active=true`, { headers })
+        .then((r) => r.json())
+        .then((res) => {
+          if (res?.success && Array.isArray(res.data)) {
+            const feeTpl = res.data.find((t: any) =>
+              ['FEE_DUE', 'FEE_OVERDUE', 'FEE_REMINDER'].includes(t.event_type)
+            );
+            if (feeTpl?.body) {
+              setFeeWhatsappTemplate(feeTpl.body);
+              try {
+                localStorage.setItem('gurukul_whatsapp_fee_template', feeTpl.body);
+              } catch {}
+            }
+          }
+        })
+        .catch(() => null);
+    } catch (err: any) {
+      setError(err.message || 'Failed to load fee information');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, [token]);
+
+  // Handle plan create
+  const handleCreatePlan = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token) return;
+    setSubmitting(true);
+    setError(null);
+
+    try {
+      const res = await authFetch(`${API_BASE}/fees/plans`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          name: planForm.name,
+          amount: parseFloat(planForm.amount),
+          frequency: planForm.frequency,
+          dueDay: parseInt(planForm.dueDay, 10),
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || 'Plan creation failed');
+
+      setIsPlanModalOpen(false);
+      setPlanForm({ name: '', amount: '', frequency: 'MONTHLY', dueDay: '10' });
+      await fetchData();
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Handle fee assignment
+  const handleAssignFee = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token) return;
+    setSubmitting(true);
+    setError(null);
+
+    try {
+      const res = await authFetch(`${API_BASE}/fees/students`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          studentId: assignForm.studentId,
+          feePlanId: assignForm.feePlanId || undefined,
+          billingPeriod: assignForm.billingPeriod,
+          amountDue: parseFloat(assignForm.amountDue),
+          dueDate: assignForm.dueDate,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        if (data.error?.code === 'DUPLICATE_FEE_ASSIGNMENT' || data.error?.message?.includes('already assigned')) {
+          throw new Error(`Duplicate Fee Period: This student already has fee assigned for ${formatBillingPeriod(assignForm.billingPeriod)}. Each student can only receive one fee assignment per monthly period.`);
+        }
+        throw new Error(data.error?.message || 'Fee assignment failed');
+      }
+
+      setIsAssignModalOpen(false);
+      setAssignForm({
+        studentId: '',
+        feePlanId: '',
+        billingPeriod: `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`,
+        amountDue: '',
+        dueDate: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 10).toISOString().split('T')[0],
+      });
+      await fetchData();
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Auto-fill amount when fee plan selected
+  const handlePlanSelect = (planId: string) => {
+    if (planId === 'STUDENT_COURSE') {
+      const selectedStudent = students.find((s) => s.id === assignForm.studentId);
+      if (selectedStudent && selectedStudent.monthlyFee) {
+        setAssignForm((prev) => ({
+          ...prev,
+          feePlanId: '',
+          amountDue: String(selectedStudent.monthlyFee),
+        }));
+      }
+      return;
+    }
+
+    const selected = feePlans.find((p) => p.id === planId);
+    if (selected) {
+      setAssignForm((prev) => ({
+        ...prev,
+        feePlanId: planId,
+        amountDue: String(selected.amount),
+      }));
+    } else {
+      setAssignForm((prev) => ({ ...prev, feePlanId: planId }));
+    }
+  };
+
+  const handleStudentSelect = (studentId: string) => {
+    const sel = students.find((s) => s.id === studentId);
+    let detectedPlanId = '';
+    let detectedAmount = '';
+
+    if (sel) {
+      const matched = feePlans.find(
+        (p) =>
+          p.id === (sel as any).feePlanId ||
+          p.name.trim().toLowerCase() === (sel.course || '').trim().toLowerCase()
+      );
+      if (matched) {
+        detectedPlanId = matched.id;
+        detectedAmount = String(matched.amount);
+      } else if (sel.monthlyFee) {
+        detectedAmount = String(sel.monthlyFee);
+      }
+    }
+
+    setAssignForm((prev) => ({
+      ...prev,
+      studentId,
+      feePlanId: detectedPlanId || prev.feePlanId,
+      amountDue: detectedAmount || prev.amountDue,
+    }));
+  };
+
+  // Open pay modal (supports custom amount & custom payment date)
+  const handleOpenPay = (fee: StudentFee, defaultMode: 'CASH' | 'MOCK' = 'CASH', customAmount?: string) => {
+    setSelectedFee(fee);
+    const pendingVal = fee.pending_amount !== undefined && fee.pending_amount !== null
+      ? Number(fee.pending_amount)
+      : Math.max(0, Number(fee.amount_due || 0) - Number(fee.amount_paid || 0));
+
+    const chosenAmount = customAmount !== undefined
+      ? customAmount
+      : String(pendingVal > 0 ? pendingVal : fee.amount_due || '');
+
+    setPayForm({
+      amount: chosenAmount,
+      paymentMethod: 'CASH',
+      provider: defaultMode === 'CASH' ? 'MANUAL' : 'MOCK',
+      notes: defaultMode === 'CASH' ? 'Cash payment received at front desk' : '',
+      nextDueDate: '',
+      paymentDate: new Date().toISOString().split('T')[0],
+    });
+    setModalSuccessMessage(null);
+    setIsPayModalOpen(true);
+  };
+
+  // Handle payment record submission
+  const handleRecordPayment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !selectedFee) return;
+    setSubmitting(true);
+    setError(null);
+    setModalSuccessMessage(null);
+
+    try {
+      const amountNum = parseFloat(payForm.amount);
+
+      if (payForm.provider === 'MANUAL') {
+        const res = await authFetch(`${API_BASE}/payments/manual`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            studentId: selectedFee.student_id,
+            studentFeeId: selectedFee.id,
+            amount: amountNum,
+            paymentMethod: payForm.paymentMethod,
+            paidAt: payForm.paymentDate,
+            paymentDate: payForm.paymentDate,
+            notes: payForm.notes || 'Cash payment received at front desk',
+            nextDueDate: payForm.nextDueDate || undefined,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error?.message || 'Payment recording failed');
+
+        // Optimistic state update for instantaneous feedback
+        setStudentFees((prev) =>
+          prev.map((f) => {
+            if (f.id === selectedFee.id) {
+              const newPaid = Number(f.amount_paid || 0) + amountNum;
+              const newPending = Math.max(0, Number(f.amount_due || 0) - newPaid);
+              const newStatus = newPending <= 0 ? 'PAID' : 'PARTIAL';
+              return {
+                ...f,
+                amount_paid: newPaid,
+                pending_amount: newPending,
+                status: newStatus as any,
+                due_date: payForm.nextDueDate || f.due_date,
+              };
+            }
+            return f;
+          })
+        );
+
+        const receiptNo = data.data?.receipt?.receipt_number || 'Issued';
+        setModalSuccessMessage(`Payment recorded successfully! Receipt: ${receiptNo}`);
+      } else {
+        const orderRes = await authFetch(`${API_BASE}/payments/order`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            studentId: selectedFee.student_id,
+            studentFeeId: selectedFee.id,
+            amount: amountNum,
+            provider: 'MOCK',
+          }),
+        });
+        const orderData = await orderRes.json();
+        if (!orderRes.ok) throw new Error(orderData.error?.message || 'Order creation failed');
+
+        const { paymentRecordId, orderId } = orderData.data;
+        const mockPaymentId = `mock_pay_${Date.now()}`;
+        const verifyRes = await authFetch(`${API_BASE}/payments/verify`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            paymentRecordId,
+            orderId,
+            paymentId: mockPaymentId,
+            signature: 'mock_valid_signature',
+            provider: 'MOCK',
+          }),
+        });
+        const verifyData = await verifyRes.json();
+        if (!verifyRes.ok) throw new Error(verifyData.error?.message || 'Payment verification failed');
+
+        const receiptNo = verifyData.data?.receipt?.receipt_number || 'Generated';
+        setModalSuccessMessage(
+          `Verified & Completed! Receipt #${receiptNo} (Provider: MOCK)`
+        );
+      }
+
+      await fetchData();
+      setTimeout(() => {
+        setIsPayModalOpen(false);
+      }, 700);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Send WhatsApp Fee Reminder with payment link
+  const handleSendWhatsAppReminder = async (fee: StudentFee) => {
+    if (!token) return;
+    setSendingReminderId(fee.id);
+    setError(null);
+    setReminderSuccessMessage(null);
+    try {
+      const res = await authFetch(`${API_BASE}/whatsapp/trigger-fee-reminder`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          studentFeeId: fee.id,
+          studentId: fee.student_id,
+          eventType: fee.status === 'OVERDUE' ? 'FEE_OVERDUE' : 'FEE_DUE',
+          customTemplate: feeWhatsappTemplate || undefined,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error?.message || data.message || 'Failed to dispatch WhatsApp reminder.');
+      }
+
+      const msg = data.message || `WhatsApp reminder queued for ${fee.student?.name || 'student'}!`;
+      setReminderSuccessMessage(msg);
+      toast.success(msg);
+      setTimeout(() => setReminderSuccessMessage(null), 6000);
+    } catch (err: any) {
+      setError(err.message || 'Error sending WhatsApp reminder');
+      toast.error(err.message || 'WhatsApp Gateway disconnected. Please connect in WhatsApp Settings.');
+    } finally {
+      setSendingReminderId(null);
+    }
+  };
+
+  const handleTriggerMonthlyReminders = async () => {
+    if (!token) return;
+    setTriggeringMonthly(true);
+    setError(null);
+    setReminderSuccessMessage(null);
+    try {
+      const res = await authFetch(`${API_BASE}/whatsapp/remind/monthly-fees`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error?.message || data.message || 'Failed to trigger monthly reminders');
+      }
+
+      setReminderSuccessMessage(
+        `Monthly fee reminders queued for ${data.data?.queuedCount || 0} students! Dispatched safely via WhatsApp queue.`
+      );
+      toast.success(`Monthly fee reminders queued for ${data.data?.queuedCount || 0} students!`);
+      setTimeout(() => setReminderSuccessMessage(null), 8000);
+    } catch (err: any) {
+      setError(err.message || 'Error triggering monthly fee reminders');
+      toast.error(err.message || 'WhatsApp Gateway disconnected. Please connect in WhatsApp Settings.');
+    } finally {
+      setTriggeringMonthly(false);
+    }
+  };
+
+  const handleOpenAdjustFee = (fee: StudentFee) => {
+    setAdjustingFee({
+      id: fee.id,
+      studentName: fee.student?.name || 'Student',
+      amountDue: String(fee.amount_due || fee.pending_amount || 0),
+      dueDate: fee.due_date ? fee.due_date.split('T')[0] : new Date().toISOString().split('T')[0],
+    });
+    setIsAdjustFeeModalOpen(true);
+  };
+
+  const handleSaveAdjustFee = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !adjustingFee) return;
+    setAdjustingLoading(true);
+    setError(null);
+    try {
+      const res = await authFetch(`${API_BASE}/fees/students/${adjustingFee.id}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          amountDue: parseFloat(adjustingFee.amountDue),
+          dueDate: adjustingFee.dueDate,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || data.message || 'Failed to update student fee');
+
+      setReminderSuccessMessage(`Fee dues updated successfully for ${adjustingFee.studentName}!`);
+      setTimeout(() => setReminderSuccessMessage(null), 5000);
+      setIsAdjustFeeModalOpen(false);
+      await fetchData();
+    } catch (err: any) {
+      setError(err.message || 'Error updating student fee');
+    } finally {
+      setAdjustingLoading(false);
+    }
+  };
+
+  // Delete student and all associated fee records permanently
+  const handleDeleteStudentRecord = (fee: StudentFee) => {
+    setStudentToDeleteFromFees({
+      id: fee.student_id,
+      name: fee.student?.name || 'Student',
+    });
+  };
+
+  const handleConfirmDeleteStudentFromFees = async () => {
+    if (!studentToDeleteFromFees || !token) return;
+    const targetStudentId = studentToDeleteFromFees.id;
+    const studentName = studentToDeleteFromFees.name;
+    setDeletingStudentFromFees(true);
+
+    // Optimistic UI update: immediately remove all fee rows and student from local state
+    setStudentFees((prev) => prev.filter((f) => f.student_id !== targetStudentId));
+    setStudents((prev) => prev.filter((s) => s.id !== targetStudentId));
+    setStudentToDeleteFromFees(null);
+
+    try {
+      const res = await authFetch(`${API_BASE}/students/${targetStudentId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Failed to delete student');
+
+      toast.success(`Student "${studentName}" and all associated records permanently deleted.`);
+      await fetchData();
+    } catch (err: any) {
+      toast.error(`Failed to delete student: ${err.message || 'Unknown error'}`);
+      await fetchData();
+    } finally {
+      setDeletingStudentFromFees(false);
+    }
+  };
+
+  const handleSaveFeeTemplate = async () => {
+    try {
+      localStorage.setItem('gurukul_whatsapp_fee_template', feeWhatsappTemplate);
+
+      if (token) {
+        // Sync to Supabase whatsapp_templates table via API
+        try {
+          const tplsRes = await authFetch(`${API_BASE}/whatsapp/templates?active=true`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          const tplsJson = await tplsRes.json().catch(() => null);
+          const tpls = tplsJson?.data || [];
+          const existingTpls = tpls.filter((t: any) =>
+            ['FEE_DUE', 'FEE_OVERDUE', 'FEE_REMINDER'].includes(t.event_type)
+          );
+
+          if (existingTpls.length > 0) {
+            await Promise.all(
+              existingTpls.map((tpl: any) =>
+                authFetch(`${API_BASE}/whatsapp/templates/${tpl.id}`, {
+                  method: 'PATCH',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                  body: JSON.stringify({
+                    body: feeWhatsappTemplate,
+                    name: tpl.name || 'Fee Reminder',
+                    active: true,
+                  }),
+                })
+              )
+            );
+          } else {
+            await authFetch(`${API_BASE}/whatsapp/templates`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                name: 'Fee Due Reminder',
+                eventType: 'FEE_DUE',
+                body: feeWhatsappTemplate,
+                active: true,
+              }),
+            });
+          }
+        } catch (dbErr) {
+          console.warn('Could not sync fee template to backend DB:', dbErr);
+        }
+      }
+
+      setIsFeeTemplateOpen(false);
+      setReminderSuccessMessage('WhatsApp Fee Reminder template saved successfully!');
+      toast.success('WhatsApp Fee Reminder template saved to database!');
+      setTimeout(() => setReminderSuccessMessage(null), 4000);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const [syncingMonthly, setSyncingMonthly] = useState(false);
+  const handleSyncMonthlyFees = async () => {
+    if (!token) return;
+    setSyncingMonthly(true);
+    setError(null);
+    try {
+      const now = new Date();
+      const currentPeriod = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+      const res = await authFetch(`${API_BASE}/fees/sync-monthly`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ billingPeriod: currentPeriod }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        const msg = `Monthly fees synchronized for ${data.data?.period || currentPeriod}! Generated: ${data.data?.createdCount || 0} active student bills, Verified: ${data.data?.existingCount || 0} students.`;
+        setReminderSuccessMessage(msg);
+        toast.success(msg);
+        setTimeout(() => setReminderSuccessMessage(null), 8000);
+        await fetchData();
+      } else {
+        throw new Error(data.error?.message || data.message || 'Failed to sync monthly fees');
+      }
+    } catch (err: any) {
+      setError(err.message || 'Error syncing monthly fees');
+      toast.error(err.message || 'Error syncing monthly fees');
+    } finally {
+      setSyncingMonthly(false);
+    }
+  };
+
+  const handleOpenEditPlan = (plan: FeePlan) => {
+    setEditingPlan(plan);
+    setEditPlanForm({
+      name: plan.name,
+      amount: String(plan.amount),
+      frequency: plan.frequency || 'MONTHLY',
+      dueDay: String(plan.due_day || 5),
+    });
+    setIsEditPlanModalOpen(true);
+  };
+
+  const handleUpdatePlan = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !editingPlan) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const res = await authFetch(`${API_BASE}/fees/plans/${editingPlan.id}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          name: editPlanForm.name.trim(),
+          amount: parseFloat(editPlanForm.amount),
+          frequency: editPlanForm.frequency,
+          dueDay: parseInt(editPlanForm.dueDay, 10),
+        }),
+      });
+      await res.json();
+      setFeePlans((prev) =>
+        prev.map((p) =>
+          p.id === editingPlan.id
+            ? {
+                ...p,
+                name: editPlanForm.name.trim(),
+                amount: parseFloat(editPlanForm.amount),
+                frequency: editPlanForm.frequency as any,
+                due_day: parseInt(editPlanForm.dueDay, 10),
+              }
+            : p
+        )
+      );
+      setIsEditPlanModalOpen(false);
+      setEditingPlan(null);
+      setReminderSuccessMessage(`Course fee plan "${editPlanForm.name}" updated successfully!`);
+      setTimeout(() => setReminderSuccessMessage(null), 5000);
+      await fetchData();
+    } catch (err: any) {
+      setError(err.message || 'Error updating fee plan');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Toggle plan active status
+  const handleTogglePlan = async (id: string, currentActive: boolean) => {
+    if (!token) return;
+    try {
+      const endpoint = currentActive ? 'deactivate' : 'activate';
+      await authFetch(`${API_BASE}/fees/plans/${id}/${endpoint}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      await fetchData();
+    } catch (err: any) {
+      setError(err.message);
+    }
+  };
+
+  // 1-to-1 Reconciled Tuition accounts perfectly synchronized with Payments Ledger
+  const allTuitionAccounts = useMemo(() => {
+    const studentMap = new Map<string, any>();
+
+    // 1. Initialize from full students roster so every student is accounted for
+    (students || []).forEach((s) => {
+      const defaultPkg = Number(s.monthly_fee ?? s.monthlyFee ?? 0);
+      studentMap.set(s.id, {
+        id: s.id,
+        student_id: s.id,
+        student: s,
+        amount_due: defaultPkg,
+        amount_paid: 0,
+        pending_amount: defaultPkg,
+        status: 'PENDING',
+        due_date: null,
+        billing_period: 'Current Enrollment',
+        fee_plan: { name: s.course || 'Athletics & Martial Arts' },
+        feeRecords: [] as any[],
+        scheduledInstallments: [],
+      });
+    });
+
+    // 2. Aggregate all student_fees records per student
+    (studentFees || []).forEach((fee) => {
+      const studentId = fee.student_id;
+      const existing = studentMap.get(studentId);
+      if (!existing) {
+        studentMap.set(studentId, {
+          id: fee.id,
+          student_id: studentId,
+          student: fee.student,
+          amount_due: Number(fee.amount_due || 0),
+          amount_paid: Number(fee.amount_paid || 0),
+          pending_amount: Math.max(0, Number(fee.amount_due || 0) - Number(fee.amount_paid || 0)),
+          status: fee.status || 'PENDING',
+          due_date: fee.due_date,
+          billing_period: fee.billing_period,
+          fee_plan: fee.fee_plan || { name: fee.student?.course || 'Athletics & Martial Arts' },
+          feeRecords: [fee],
+          scheduledInstallments: [],
+        });
+      } else {
+        if (existing.feeRecords.length === 0) {
+          existing.amount_due = Number(fee.amount_due || 0);
+          existing.amount_paid = Number(fee.amount_paid || 0);
+          existing.billing_period = fee.billing_period;
+          existing.due_date = fee.due_date;
+          existing.status = fee.status || 'PENDING';
+          existing.id = fee.id;
+        } else {
+          existing.amount_due += Number(fee.amount_due || 0);
+          existing.amount_paid += Number(fee.amount_paid || 0);
+          if (fee.status === 'OVERDUE' || existing.status === 'OVERDUE') existing.status = 'OVERDUE';
+          if (fee.due_date && (!existing.due_date || new Date(fee.due_date) > new Date(existing.due_date))) {
+            existing.due_date = fee.due_date;
+            existing.billing_period = fee.billing_period;
+          }
+        }
+        existing.feeRecords.push(fee);
+      }
+    });
+
+    // 3. Reconcile with verified payments from paymentsList
+    studentMap.forEach((acc, sId) => {
+      const confirmedPays = (paymentsList || []).filter(
+        (p) => (p.student_id === sId || p.student?.id === sId) && p.status === 'SUCCESS'
+      );
+      const paidSum = confirmedPays.reduce((sum, p) => sum + Number(p.amount || 0), 0);
+      acc.amount_paid = Math.max(acc.amount_paid, paidSum);
+      acc.pending_amount = Math.max(0, acc.amount_due - acc.amount_paid);
+
+      if (acc.amount_paid >= acc.amount_due && acc.amount_due > 0) {
+        acc.status = 'PAID';
+      } else if (acc.amount_paid > 0 && acc.pending_amount > 0) {
+        acc.status = 'PARTIAL';
+      }
+    });
+
+    return Array.from(studentMap.values());
+  }, [students, studentFees, paymentsList]);
+
+  // Genuine financial totals across enrolled students (aligned with Payments ledger)
+  const totalBilled = useMemo(() => {
+    return allTuitionAccounts.reduce((acc, f) => acc + Number(f?.amount_due || 0), 0);
+  }, [allTuitionAccounts]);
+
+  const totalCollected = useMemo(() => {
+    return allTuitionAccounts.reduce((acc, f) => acc + Number(f?.amount_paid || 0), 0);
+  }, [allTuitionAccounts]);
+
+  const totalPending = useMemo(() => {
+    return allTuitionAccounts.reduce(
+      (acc, f) => acc + Number(f?.pending_amount ?? Math.max(0, Number(f?.amount_due || 0) - Number(f?.amount_paid || 0))),
+      0
+    );
+  }, [allTuitionAccounts]);
+
+  const overdueCount = useMemo(() => {
+    return allTuitionAccounts.filter((f) => f?.status === 'OVERDUE').length;
+  }, [allTuitionAccounts]);
+
+  // Filtered student fees for search & status filter
+  const q = (searchQuery || '').trim().toLowerCase();
+  const displayFees = useMemo(() => {
+    return allTuitionAccounts.filter((fee) => {
+      const studentName = (fee.student?.name || '').toLowerCase();
+      const billingPeriod = (fee.billing_period || '').toLowerCase();
+      const planName = (fee.fee_plan?.name || fee.student?.course || '').toLowerCase();
+
+      const matchesSearch =
+        !q ||
+        studentName.includes(q) ||
+        billingPeriod.includes(q) ||
+        planName.includes(q);
+
+      const matchesStatus =
+        statusFilter === 'ALL' ||
+        fee.status === statusFilter ||
+        (statusFilter === 'PENDING' && (fee.status === 'PENDING' || fee.status === 'PARTIAL' || fee.status === 'OVERDUE'));
+
+      return matchesSearch && matchesStatus;
+    });
+  }, [allTuitionAccounts, q, statusFilter]);
+
+  return (
+    <div className="space-y-6 animate-in fade-in duration-200">
+      {/* Primary Academic Fee Header & Shortcuts */}
+      <div className="p-3 bg-gradient-to-r from-slate-900 to-[#0F172A] border border-white/10 rounded-2xl flex flex-wrap items-center justify-between gap-3 shadow-md">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-bold text-amber-400 uppercase tracking-wider flex items-center gap-1.5">
+            <CreditCard className="w-4 h-4 text-amber-500" />
+            Academic Fees Only
+          </span>
+          <span className="text-xs text-slate-400 hidden sm:inline">
+            (Monthly course subscriptions &amp; annual tuition fees)
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2 flex-wrap">
+          <Link
+            to="/admin/publications"
+            className="px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-500/10 text-amber-300 border border-amber-500/30 hover:bg-amber-500/20 flex items-center gap-1.5 transition-colors"
+          >
+            <BookOpen className="w-3.5 h-3.5" />
+            <span>Publications &amp; Uniforms</span>
+            <ArrowRight className="w-3 h-3" />
+          </Link>
+          <Link
+            to="/admin/payments"
+            className="px-3 py-1.5 rounded-lg text-xs font-bold bg-indigo-500/10 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-500/20 flex items-center gap-1.5 transition-colors"
+          >
+            <Banknote className="w-3.5 h-3.5" />
+            <span>Payments Ledger (All Streams)</span>
+            <ArrowRight className="w-3 h-3" />
+          </Link>
+        </div>
+      </div>
+          {/* Top Header */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-slate-200/60 dark:border-slate-800">
+            <div>
+              <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                Fee &amp; Billing Operations
+              </h1>
+              <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+                Monitor academy receivables, configure fee plans, and manage student fee schedules.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <Button
+                variant="secondary"
+                onClick={handleSyncMonthlyFees}
+                disabled={syncingMonthly}
+                className="gap-2 border-indigo-300 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 font-semibold text-xs sm:text-sm"
+                title="Automatically generate current month bills for all active monthly students"
+              >
+                <RotateCcw className={`w-4 h-4 text-indigo-600 ${syncingMonthly ? 'animate-spin' : ''}`} />
+                <span>{syncingMonthly ? 'Syncing...' : 'Sync Current Month Bills'}</span>
+              </Button>
+
+              <Button
+                variant="secondary"
+                onClick={handleTriggerMonthlyReminders}
+                disabled={triggeringMonthly}
+                className="gap-2 border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 font-semibold text-xs sm:text-sm"
+                title="Trigger automated WhatsApp fee reminders for pending student dues"
+              >
+                <MessageSquare className={`w-4 h-4 text-emerald-600 ${triggeringMonthly ? 'animate-spin' : ''}`} />
+                <span>{triggeringMonthly ? 'Queuing Reminders...' : 'Send Fee Reminders'}</span>
+              </Button>
+
+              <Button
+                variant="secondary"
+                onClick={() => window.print()}
+                className="gap-2 border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 font-semibold text-xs sm:text-sm"
+                title="Download or Print full Academy Fee Ledger as PDF"
+              >
+                <Printer className="w-4 h-4 text-slate-600 dark:text-slate-400" />
+                <span>Print / PDF Ledger</span>
+              </Button>
+
+              {activeTab === 'student_fees' ? (
+                <Button
+                  onClick={() => setIsAssignModalOpen(true)}
+                  className="gap-2 shadow-sm"
+                >
+                  <Plus className="w-4 h-4" />
+                  Assign Student Fee
+                </Button>
+              ) : (
+                <Button
+                  onClick={() => setIsPlanModalOpen(true)}
+                  className="gap-2 shadow-sm"
+                >
+                  <Plus className="w-4 h-4" />
+                  Add Course / Fee Plan
+                </Button>
+              )}
+            </div>
+          </div>
+
+      {error && (
+        <div className="p-4 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-200 text-sm flex items-center gap-2.5 shadow-sm">
+          <AlertCircle className="w-4 h-4 flex-shrink-0 text-rose-600 dark:text-rose-400" />
+          <span className="font-medium">{error}</span>
+        </div>
+      )}
+
+      {reminderSuccessMessage && (
+        <div className="p-4 rounded-xl bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200 text-sm flex items-center gap-2.5 shadow-sm">
+          <CheckCircle2 className="w-4 h-4 flex-shrink-0 text-emerald-600 dark:text-emerald-400" />
+          <span className="font-medium">{reminderSuccessMessage}</span>
+        </div>
+      )}
+
+      {/* Requirement 6: Automated Fee Reminder Cadence Flow Pipeline */}
+      <FeeReminderPipelineGraph onTriggerSuccess={fetchData} className="mb-4" />
+
+      {/* WhatsApp Fee Reminder Template & Schedule Automation Card */}
+      <Card className="p-4 bg-gradient-to-br from-emerald-950/20 via-slate-900 to-slate-900 border border-emerald-500/30 rounded-2xl shadow-sm">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 pb-3 border-b border-emerald-500/20">
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+              <MessageSquare className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-bold text-slate-100">WhatsApp Fee Reminder Message &amp; Automation</h3>
+                <span className="text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                  Active Template
+                </span>
+              </div>
+              <p className="text-xs text-slate-400">
+                Automated dues notification sent to parents. Admin can edit message text and scheduling triggers anytime.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setIsFeeTemplateOpen(!isFeeTemplateOpen)}
+              className="text-xs h-8 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"
+            >
+              <Edit2 className="w-3.5 h-3.5 mr-1.5" />
+              {isFeeTemplateOpen ? 'Collapse Editor' : 'Edit Template & Rules'}
+            </Button>
+            <Button
+              size="sm"
+              onClick={handleTriggerMonthlyReminders}
+              disabled={triggeringMonthly}
+              className="text-xs h-8 bg-emerald-600 hover:bg-emerald-700 text-white"
+            >
+              <Send className="w-3.5 h-3.5 mr-1.5" />
+              {triggeringMonthly ? 'Dispatching...' : 'Send Reminders Now'}
+            </Button>
+          </div>
+        </div>
+
+        {/* Live Preview Summary when collapsed */}
+        {!isFeeTemplateOpen && (
+          <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+            <div className="md:col-span-2 p-2.5 rounded-xl bg-black/40 border border-white/5 font-mono text-[11px] text-slate-300 line-clamp-2">
+              "{feeWhatsappTemplate}"
+            </div>
+            <div className="flex flex-col justify-center p-2.5 rounded-xl bg-emerald-950/30 border border-emerald-500/20 text-slate-300 space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-emerald-300 text-[11px]">5-Stage Cadence:</span>
+                <span className="text-[10px] text-emerald-400 font-medium">Standard Dues</span>
+              </div>
+              <div className="flex flex-wrap gap-1 text-[10px]">
+                {reminderRules.fiveDaysBefore && <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">T-5d</span>}
+                {reminderRules.twoDaysBefore && <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">T-2d</span>}
+                {reminderRules.onDueDate && <span className="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300">Due Date</span>}
+                {reminderRules.twoDaysAfter && <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300">+2d Grace</span>}
+                {reminderRules.fourDaysAfter && <span className="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300">+4d Flag</span>}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Expanded Editor & Rules */}
+        {isFeeTemplateOpen && (
+          <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-bold text-slate-200 mb-1.5">
+                  Template Message Text
+                </label>
+                <textarea
+                  ref={templateTextareaRef}
+                  value={feeWhatsappTemplate}
+                  onChange={(e) => setFeeWhatsappTemplate(e.target.value)}
+                  rows={4}
+                  className="w-full text-xs font-sans p-3 rounded-xl bg-slate-950 border border-slate-700 text-slate-100 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
+                  placeholder="Enter message text..."
+                />
+              </div>
+
+              <div>
+                <span className="text-[11px] font-semibold text-slate-400 block mb-1">Insert Dynamic Variable Tags (At Cursor Position):</span>
+                <div className="flex flex-wrap gap-1.5">
+                  {[
+                    '{student_name}',
+                    '{parent_name}',
+                    '{course}',
+                    '{pending_amount}',
+                    '{due_date}',
+                  ].map((tag) => (
+                    <button
+                      key={tag}
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => handleInsertTagAtCursor(tag)}
+                      className="px-2 py-0.5 rounded-md text-[11px] font-mono bg-slate-800 hover:bg-slate-700 border border-slate-600 text-indigo-300 transition-colors"
+                    >
+                      + {tag}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="pt-2 flex items-center justify-between">
+                <Button
+                  size="sm"
+                  onClick={handleSaveFeeTemplate}
+                  className="text-xs bg-emerald-600 hover:bg-emerald-700 text-white"
+                >
+                  <Check className="w-3.5 h-3.5 mr-1.5" />
+                  Save Template Changes
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setFeeWhatsappTemplate(DEFAULT_FEE_TEMPLATE)}
+                  className="text-xs text-slate-400 hover:text-slate-200"
+                >
+                  Reset Default
+                </Button>
+              </div>
+            </div>
+
+            {/* Live Recipient WhatsApp Bubble & Multi-Rule Triggers */}
+            <div className="space-y-3">
+              <div>
+                <span className="text-xs font-bold text-slate-200 block mb-1.5">
+                  📱 Live Recipient WhatsApp Preview
+                </span>
+                <div className="p-3.5 rounded-2xl bg-[#0b141a] border border-[#222e35] text-xs font-sans text-slate-100 relative">
+                  <div className="bg-[#005c4b] text-[#e9edef] p-3 rounded-xl rounded-tr-none shadow-sm space-y-1.5">
+                    <p className="whitespace-pre-wrap leading-relaxed text-[12px]">
+                      {feeWhatsappTemplate
+                        .replace(/(?:\{\{|\{)\s*student_name\s*(?:\}\}|\})/gi, 'Aarav Patil')
+                        .replace(/(?:\{\{|\{)\s*parent_name\s*(?:\}\}|\})/gi, 'Rajesh Patil')
+                        .replace(/(?:\{\{|\{)\s*course\s*(?:\}\}|\})/gi, 'Kalarippayattu')
+                        .replace(/(?:\{\{|\{)\s*pending_amount\s*(?:\}\}|\})/gi, '10,000')
+                        .replace(/(?:\{\{|\{)\s*due_date\s*(?:\}\}|\})/gi, '10 Nov 2026')
+                        .replace(/(?:\{\{|\{)\s*payment_link\s*(?:\}\}|\})/gi, '')}
+                    </p>
+                    <div className="flex items-center justify-end gap-1 text-[10px] text-[#8696a0]">
+                      <span>10:30 AM</span>
+                      <span className="text-[#53bdeb]">✓✓</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-slate-200 block">
+                    ⚙️ 5-Stage Automated Reminder Cadence &amp; Overdue Settings:
+                  </span>
+                  <span className="text-[10px] text-emerald-400 font-semibold">Active Timeline</span>
+                </div>
+
+                {/* 5 Milestone Checkboxes */}
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
+                  <label className="flex items-center gap-2 p-2 rounded-lg bg-slate-900 border border-slate-800 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={reminderRules.fiveDaysBefore}
+                      onChange={(e) => setReminderRules((r: any) => ({ ...r, fiveDaysBefore: e.target.checked }))}
+                      className="rounded text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <span className="text-[11px] text-slate-300">1. 5 Days Before (T-5d)</span>
+                  </label>
+                  <label className="flex items-center gap-2 p-2 rounded-lg bg-slate-900 border border-slate-800 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={reminderRules.twoDaysBefore}
+                      onChange={(e) => setReminderRules((r: any) => ({ ...r, twoDaysBefore: e.target.checked }))}
+                      className="rounded text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <span className="text-[11px] text-slate-300">2. 2 Days Before (T-2d)</span>
+                  </label>
+                  <label className="flex items-center gap-2 p-2 rounded-lg bg-slate-900 border border-slate-800 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={reminderRules.onDueDate}
+                      onChange={(e) => setReminderRules((r: any) => ({ ...r, onDueDate: e.target.checked }))}
+                      className="rounded text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <span className="text-[11px] text-slate-300">3. On Due Date (Day 0)</span>
+                  </label>
+                  <label className="flex items-center gap-2 p-2 rounded-lg bg-slate-900 border border-slate-800 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={reminderRules.twoDaysAfter}
+                      onChange={(e) => setReminderRules((r: any) => ({ ...r, twoDaysAfter: e.target.checked }))}
+                      className="rounded text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <span className="text-[11px] text-slate-300">4. 2 Days Overdue (T+2d)</span>
+                  </label>
+                  <label className="flex items-center gap-2 p-2 rounded-lg bg-slate-900 border border-slate-800 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={reminderRules.fourDaysAfter}
+                      onChange={(e) => setReminderRules((r: any) => ({ ...r, fourDaysAfter: e.target.checked }))}
+                      className="rounded text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <span className="text-[11px] text-slate-300">5. 4 Days Overdue (T+4d Flag)</span>
+                  </label>
+                </div>
+
+                {/* Grace Days Configuration */}
+                <div className="pt-2 border-t border-slate-800/80">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-400 mb-1">
+                      Grace Period / देय सवलत दिवस
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={15}
+                      value={reminderRules.graceDays || 2}
+                      onChange={(e) => setReminderRules((r: any) => ({ ...r, graceDays: Number(e.target.value) }))}
+                      className="w-full sm:w-1/2 px-2.5 py-1 text-xs rounded-lg bg-slate-900 border border-slate-700 text-slate-100 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {/* 4 Financial KPI Overview Cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+        <Card hoverEffect accent="indigo" className="p-5 flex flex-col justify-between">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Total Billed</span>
+            <div className="w-10 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-950/50 text-indigo-600 dark:text-indigo-400 flex items-center justify-center border border-indigo-100 dark:border-indigo-800/60">
+              <DollarSign className="w-5 h-5" />
+            </div>
+          </div>
+          <div className="mt-3">
+            <div className="text-3xl font-extrabold text-slate-900 dark:text-slate-100 tracking-tight">₹{totalBilled.toLocaleString('en-IN')}</div>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Across all assigned student fee dues</p>
+          </div>
+        </Card>
+
+        <Card hoverEffect accent="emerald" className="p-5 flex flex-col justify-between">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Collected</span>
+            <div className="w-10 h-10 rounded-xl bg-emerald-50 dark:bg-emerald-950/50 text-emerald-600 dark:text-emerald-400 flex items-center justify-center border border-emerald-100 dark:border-emerald-800/60">
+              <CheckCircle2 className="w-5 h-5" />
+            </div>
+          </div>
+          <div className="mt-3">
+            <div className="text-3xl font-extrabold text-emerald-700 dark:text-emerald-400 tracking-tight">₹{totalCollected.toLocaleString('en-IN')}</div>
+            <p className="text-xs text-emerald-600 dark:text-emerald-400 font-semibold mt-1">
+              {totalBilled > 0 ? `${Math.round((totalCollected / totalBilled) * 100)}% recovery rate` : 'No billing yet'}
+            </p>
+          </div>
+        </Card>
+
+        <Card hoverEffect accent="amber" className="p-5 flex flex-col justify-between">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Pending Dues</span>
+            <div className="w-10 h-10 rounded-xl bg-amber-50 dark:bg-amber-950/50 text-amber-600 dark:text-amber-400 flex items-center justify-center border border-amber-100 dark:border-amber-800/60">
+              <Clock className="w-5 h-5" />
+            </div>
+          </div>
+          <div className="mt-3">
+            <div className="text-3xl font-extrabold text-amber-600 dark:text-amber-400 tracking-tight">₹{totalPending.toLocaleString('en-IN')}</div>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Awaiting settlement by parents</p>
+          </div>
+        </Card>
+
+        <Card hoverEffect accent="rose" className="p-5 flex flex-col justify-between">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Overdue Invoices</span>
+            <div className="w-10 h-10 rounded-xl bg-rose-50 dark:bg-rose-950/50 text-rose-600 dark:text-rose-400 flex items-center justify-center border border-rose-100 dark:border-rose-800/60">
+              <AlertCircle className="w-5 h-5" />
+            </div>
+          </div>
+          <div className="mt-3">
+            <div className="text-3xl font-extrabold text-rose-600 dark:text-rose-400 tracking-tight">{overdueCount}</div>
+            <p className="text-xs text-rose-600 dark:text-rose-400 font-medium mt-1">Invoices past grace due date</p>
+          </div>
+        </Card>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="inline-flex rounded-xl bg-slate-100 dark:bg-slate-900 p-1 border border-slate-200/80 dark:border-slate-800 shadow-sm">
+          <button
+            onClick={() => setActiveTab('student_fees')}
+            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all ${
+              activeTab === 'student_fees'
+                ? 'bg-white dark:bg-indigo-600 text-indigo-700 dark:text-white shadow-sm'
+                : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/60 dark:hover:bg-slate-800'
+            }`}
+          >
+            Academic Dues Ledger ({displayFees.length})
+          </button>
+          <button
+            onClick={() => setActiveTab('fee_plans')}
+            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all ${
+              activeTab === 'fee_plans'
+                ? 'bg-white dark:bg-indigo-600 text-indigo-700 dark:text-white shadow-sm'
+                : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/60 dark:hover:bg-slate-800'
+            }`}
+          >
+            Tuition Plans ({feePlans.length})
+          </button>
+        </div>
+
+        <Link
+          to="/admin/publications"
+          className="px-3 py-2 rounded-xl text-xs font-bold bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/50 border border-amber-300 dark:border-amber-500/30 flex items-center gap-1.5 transition-all shadow-xs"
+        >
+          <BookOpen className="w-3.5 h-3.5 text-amber-500" />
+          <span>Publications Fees ↗</span>
+        </Link>
+
+        <Link
+          to="/admin/payments"
+          className="px-3 py-2 rounded-xl text-xs font-bold bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 border border-indigo-300 dark:border-indigo-500/30 flex items-center gap-1.5 transition-all shadow-xs"
+        >
+          <Receipt className="w-3.5 h-3.5 text-indigo-500" />
+          <span>Unified Payments Ledger (All 3 Streams) ↗</span>
+        </Link>
+      </div>
+
+      {/* Tab 1: Student Fees Table */}
+      {activeTab === 'student_fees' && (
+        <div className="space-y-4">
+          {/* Filters Bar */}
+          <Card className="p-4 border-slate-200/80 dark:border-slate-800 shadow-sm">
+            <div className="flex flex-col sm:flex-row items-center gap-3">
+              <div className="relative flex-1 w-full">
+                <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 dark:text-slate-500" />
+                <input
+                  type="text"
+                  placeholder="Search by student name, period, or plan..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="w-full pl-10 pr-3.5 py-2 text-sm border border-slate-200/90 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-600 bg-slate-50/50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-400 transition-all"
+                />
+              </div>
+              <Select
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value)}
+                className="w-full sm:w-44 text-xs h-10"
+              >
+                <option value="ALL">All Statuses (सर्व स्थिती)</option>
+                <option value="PAID">Paid in full (पूर्ण भरले)</option>
+                <option value="PARTIAL">Partially settled (अंशतः भरले)</option>
+                <option value="PENDING">Pending (प्रलंबित)</option>
+                <option value="OVERDUE">Pending (Overdue)</option>
+              </Select>
+            </div>
+          </Card>
+
+          {loading ? (
+            <SkeletonLoader variant="table" rows={6} />
+          ) : displayFees.length === 0 ? (
+            <EmptyState
+              icon={CreditCard}
+              title={
+                searchQuery || statusFilter !== 'ALL'
+                  ? 'No fee records found'
+                  : `No fee records for ${MONTH_NAMES[new Date().getMonth()]} ${new Date().getFullYear()}`
+              }
+              description={
+                searchQuery || statusFilter !== 'ALL'
+                  ? 'No student fee invoices match your search filters.'
+                  : `Assign student fees for ${MONTH_NAMES[new Date().getMonth()]} ${new Date().getFullYear()} to begin tracking collections.`
+              }
+              actionLabel="Assign Student Fee"
+              onAction={() => setIsAssignModalOpen(true)}
+              accentColor="indigo"
+            />
+          ) : (
+            <Card className="border-slate-200/80 dark:border-slate-800 overflow-hidden shadow-card">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-slate-100 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-700 text-[11px] font-bold text-slate-700 dark:text-slate-200 uppercase tracking-wider">
+                    <tr>
+                      <th className="px-6 py-3.5">Student</th>
+                      <th className="px-5 py-3.5">Fee Plan</th>
+                      <th className="px-5 py-3.5">Billing Period</th>
+                      <th className="px-5 py-3.5">Due Date</th>
+                      <th className="px-5 py-3.5">Amount Due</th>
+                      <th className="px-5 py-3.5">Paid / Pending</th>
+                      <th className="px-5 py-3.5">Status</th>
+                      <th className="px-6 py-3.5 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800/80">
+                    {displayFees.map((fee) => (
+                      <tr key={fee.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/50 transition-colors">
+                        <td className="px-6 py-4">
+                          <div className="font-bold text-slate-900 dark:text-slate-100 leading-tight">
+                            {fee.student?.name || 'Unknown Student'}
+                          </div>
+                          <div className="mt-1 flex items-center gap-1.5">
+                            <span className="inline-flex items-center gap-1 font-mono text-[10px] font-bold text-amber-600 dark:text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/20 shadow-2xs">
+                              ID #{fee.student_id.substring(0, 8)}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-5 py-4">
+                          <div className="flex flex-col gap-1 items-start">
+                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-md text-xs font-semibold bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 border border-indigo-200/60 dark:border-indigo-800/60">
+                              {fee.fee_plan?.name || (fee.billing_period?.includes('YEARLY') ? 'Annual Package' : 'Custom Plan')}
+                            </span>
+                            {(fee.fee_plan?.frequency === 'YEARLY' || fee.billing_period?.includes('YEARLY')) && (
+                              <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-extrabold bg-amber-500/15 text-amber-500 dark:text-amber-400 border border-amber-500/30">
+                                📅 1-Year Package
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-5 py-4 text-xs">
+                          <div className="font-semibold text-slate-800 dark:text-slate-200">
+                            {formatBillingPeriod(fee.billing_period)}
+                          </div>
+                          <div className="text-[11px] font-mono text-slate-400 dark:text-slate-500">
+                            {fee.billing_period}
+                          </div>
+                          {fee.scheduledInstallments && fee.scheduledInstallments.length > 0 && (
+                            <div className="mt-1.5 flex flex-wrap gap-1">
+                              {fee.scheduledInstallments.map((inst: any) => (
+                                <span
+                                  key={inst.id}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30"
+                                  title={`Due Date: ${inst.due_date}`}
+                                >
+                                  Inst 2: ₹{Number(inst.amount_due).toLocaleString('en-IN')} (Due {inst.due_date ? new Date(inst.due_date).toLocaleDateString() : 'TBD'})
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-5 py-4 text-xs text-slate-600 dark:text-slate-400">
+                          {fee.due_date ? new Date(fee.due_date).toLocaleDateString() : '—'}
+                        </td>
+                        <td className="px-5 py-4 font-bold text-slate-900 dark:text-slate-100">
+                          ₹{Number(fee.amount_due).toLocaleString('en-IN')}
+                        </td>
+                        <td className="px-5 py-4 text-xs">
+                          <div className="font-semibold text-emerald-700 dark:text-emerald-400">
+                            ₹{Number(fee.amount_paid).toLocaleString('en-IN')} paid
+                          </div>
+                          {Number(fee.pending_amount) > 0 ? (
+                            <div className="text-amber-600 dark:text-amber-400 font-bold mt-0.5">
+                              ₹{Number(fee.pending_amount).toLocaleString('en-IN')} remaining
+                            </div>
+                          ) : (
+                            <div className="text-slate-400 text-[11px] mt-0.5">
+                              Zero balance
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-5 py-4">
+                          <StatusBadge status={fee.status} />
+                        </td>
+                        <td className="px-6 py-4 text-right">
+                          <div className="flex items-center justify-end gap-1.5">
+                            {fee.status === 'PAID' ? (
+                              <div className="flex items-center gap-2">
+                                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+                                  Fully Settled
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleUndoPayment(fee)}
+                                  disabled={undoingFeeId === fee.id}
+                                  className="px-2.5 py-1 rounded-lg text-xs font-semibold bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 text-amber-800 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40 flex items-center gap-1 transition-colors cursor-pointer"
+                                  title="Undo accidental payment and restore balance to Pending/Overdue"
+                                >
+                                  <RotateCcw className={`w-3.5 h-3.5 ${undoingFeeId === fee.id ? 'animate-spin' : ''}`} />
+                                  <span>{undoingFeeId === fee.id ? 'Reverting...' : 'Undo'}</span>
+                                </button>
+                              </div>
+                            ) : (
+                              <>
+                                {/* Mark Paid with Date & Receipt Confirmation Modal */}
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenPay(fee, 'CASH', String(fee.pending_amount || fee.amount_due || ''))}
+                                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white shadow-xs transition-all cursor-pointer"
+                                  title="Mark Paid with custom payment date & receipt"
+                                >
+                                  <Check className="w-3.5 h-3.5" />
+                                  <span>Mark Paid</span>
+                                </button>
+
+                                {/* Installment / Partial Payment Collector */}
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => handleOpenPay(fee, 'CASH')}
+                                  className="text-xs h-8 px-2.5 gap-1 text-slate-700 dark:text-slate-200 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"
+                                  title="Collect installment amount or record custom payment"
+                                >
+                                  <Banknote className="w-3.5 h-3.5 text-amber-500" />
+                                  <span>Installment</span>
+                                </Button>
+
+                                {Number(fee.amount_paid || 0) > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleUndoPayment(fee)}
+                                    disabled={undoingFeeId === fee.id}
+                                    className="px-2 py-1 rounded-lg text-xs font-semibold bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 text-amber-800 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40 flex items-center gap-1 transition-colors cursor-pointer"
+                                    title="Undo partial payment and restore balance to Pending/Overdue"
+                                  >
+                                    <RotateCcw className={`w-3.5 h-3.5 ${undoingFeeId === fee.id ? 'animate-spin' : ''}`} />
+                                    <span>{undoingFeeId === fee.id ? '...' : 'Undo'}</span>
+                                  </button>
+                                )}
+
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => handleSendWhatsAppReminder(fee)}
+                                  disabled={sendingReminderId === fee.id}
+                                  className="text-xs h-8 px-2 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/30 hover:bg-emerald-100"
+                                  title="Send WhatsApp Fee Reminder"
+                                >
+                                  <MessageSquare className={`w-3.5 h-3.5 text-emerald-600 ${sendingReminderId === fee.id ? 'animate-spin' : ''}`} />
+                                </Button>
+                              </>
+                            )}
+
+                            {/* Adjust Due Date & Amount */}
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => handleOpenAdjustFee(fee)}
+                              className="text-xs h-8 px-2 text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 border-slate-200 dark:border-slate-700"
+                              title="Adjust due date or fee amount"
+                            >
+                              <Edit2 className="w-3.5 h-3.5" />
+                            </Button>
+
+                            {/* Delete Student & Fee Record Permanently */}
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteStudentRecord(fee)}
+                              className="p-1.5 text-slate-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/30 rounded-lg transition-colors cursor-pointer border border-transparent hover:border-rose-300 dark:hover:border-rose-800"
+                              title="Delete student and all records permanently from academy"
+                            >
+                              <Trash2 className="w-3.5 h-3.5 text-rose-500" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
+        </div>
+      )}
+
+      {/* Tab 2: Fee Plans Table */}
+      {activeTab === 'fee_plans' && (
+        <Card className="border-slate-200/80 dark:border-slate-800 overflow-hidden shadow-card">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-slate-100 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-700 text-[11px] font-bold text-slate-700 dark:text-slate-200 uppercase tracking-wider">
+                <tr>
+                  <th className="px-6 py-3.5">Plan Name</th>
+                  <th className="px-5 py-3.5">Standard Amount</th>
+                  <th className="px-5 py-3.5">Billing Frequency</th>
+                  <th className="px-5 py-3.5">Due Day</th>
+                  <th className="px-5 py-3.5">Status</th>
+                  <th className="px-6 py-3.5 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800/80">
+                {feePlans.map((plan) => (
+                  <tr key={plan.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/50 transition-colors">
+                    <td className="px-6 py-4 font-bold text-slate-900 dark:text-slate-100">{plan.name}</td>
+                    <td className="px-5 py-4 font-bold text-indigo-700 dark:text-indigo-400">
+                      ₹{Number(plan.amount).toLocaleString('en-IN')}
+                    </td>
+                    <td className="px-5 py-4">
+                      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-transparent dark:border-slate-700">
+                        {plan.frequency}
+                      </span>
+                    </td>
+                    <td className="px-5 py-4 text-xs text-slate-600 dark:text-slate-400">
+                      Day {plan.due_day} of cycle
+                    </td>
+                    <td className="px-5 py-4">
+                      <StatusBadge status={plan.active ? 'ACTIVE' : 'INACTIVE'} />
+                    </td>
+                    <td className="px-6 py-4 text-right">
+                      <div className="flex items-center justify-end gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => handleOpenEditPlan(plan)}
+                          className="text-xs h-8 px-2.5 gap-1 hover:bg-slate-100 dark:hover:bg-slate-800"
+                          title="Edit Course Fee Plan"
+                        >
+                          <Edit2 className="w-3.5 h-3.5" />
+                          <span>Edit</span>
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => handleTogglePlan(plan.id, plan.active)}
+                          className={`text-xs h-8 px-2.5 ${
+                            plan.active
+                              ? 'text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 hover:border-rose-200 dark:hover:border-rose-800/60'
+                              : 'text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 hover:border-emerald-200 dark:hover:border-emerald-800/60'
+                          }`}
+                        >
+                          {plan.active ? 'Deactivate' : 'Activate'}
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {/* Modal 1: Create Fee Plan */}
+      <Modal isOpen={isPlanModalOpen} onClose={() => setIsPlanModalOpen(false)} title="Add New Course / Fee Plan">
+        <form onSubmit={handleCreatePlan} className="space-y-4">
+          <Input
+            label="Plan / Course Name *"
+            required
+            placeholder="e.g. Kalarippayattu (Monthly)"
+            value={planForm.name}
+            onChange={(e) => setPlanForm({ ...planForm, name: e.target.value })}
+          />
+          <Input
+            label="Standard Amount (₹) *"
+            type="number"
+            step="0.01"
+            min="0"
+            required
+            placeholder="e.g. 700"
+            value={planForm.amount}
+            onChange={(e) => setPlanForm({ ...planForm, amount: e.target.value })}
+          />
+          <div className="grid grid-cols-2 gap-3">
+            <Select
+              label="Billing Frequency"
+              value={planForm.frequency}
+              onChange={(e) => setPlanForm({ ...planForm, frequency: e.target.value })}
+            >
+              <option value="MONTHLY">Monthly</option>
+              <option value="YEARLY">Yearly</option>
+              <option value="QUARTERLY">Quarterly</option>
+              <option value="ONE_TIME">One Time</option>
+            </Select>
+            <Input
+              label="Due Day of Month (1-31)"
+              type="number"
+              min="1"
+              max="31"
+              required
+              value={planForm.dueDay}
+              onChange={(e) => setPlanForm({ ...planForm, dueDay: e.target.value })}
+            />
+          </div>
+          <div className="flex justify-end gap-2.5 pt-4 border-t border-slate-100 dark:border-slate-800">
+            <Button type="button" variant="outline" onClick={() => setIsPlanModalOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={submitting}>
+              {submitting ? 'Creating...' : 'Create Course Plan'}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Modal 1.5: Edit Fee Structure Plan */}
+      <Modal isOpen={isEditPlanModalOpen} onClose={() => setIsEditPlanModalOpen(false)} title="Edit Fee Structure Plan">
+        <form onSubmit={handleUpdatePlan} className="space-y-4">
+          <Input
+            label="Plan / Course Name *"
+            required
+            placeholder="e.g. Kalarippayattu (Monthly)"
+            value={editPlanForm.name}
+            onChange={(e) => setEditPlanForm({ ...editPlanForm, name: e.target.value })}
+          />
+          <Input
+            label="Standard Amount (₹) *"
+            type="number"
+            step="0.01"
+            min="0"
+            required
+            placeholder="e.g. 700"
+            value={editPlanForm.amount}
+            onChange={(e) => setEditPlanForm({ ...editPlanForm, amount: e.target.value })}
+          />
+          <div className="grid grid-cols-2 gap-3">
+            <Select
+              label="Billing Frequency"
+              value={editPlanForm.frequency}
+              onChange={(e) => setEditPlanForm({ ...editPlanForm, frequency: e.target.value })}
+            >
+              <option value="MONTHLY">Monthly</option>
+              <option value="YEARLY">Yearly</option>
+              <option value="QUARTERLY">Quarterly</option>
+              <option value="ONE_TIME">One Time</option>
+            </Select>
+            <Input
+              label="Due Day of Month (1-31)"
+              type="number"
+              min="1"
+              max="31"
+              required
+              value={editPlanForm.dueDay}
+              onChange={(e) => setEditPlanForm({ ...editPlanForm, dueDay: e.target.value })}
+            />
+          </div>
+          <div className="flex justify-end gap-2.5 pt-4 border-t border-slate-100 dark:border-slate-800">
+            <Button type="button" variant="outline" onClick={() => setIsEditPlanModalOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={submitting}>
+              {submitting ? 'Saving...' : 'Save Changes'}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Modal 2: Assign Student Fee */}
+      <Modal isOpen={isAssignModalOpen} onClose={() => setIsAssignModalOpen(false)} title="Assign Fee to Student" maxWidth="lg">
+        <form onSubmit={handleAssignFee} className="space-y-4">
+          <div>
+            <Select
+              label="Select Student *"
+              required
+              value={assignForm.studentId}
+              onChange={(e) => handleStudentSelect(e.target.value)}
+            >
+              <option value="">-- Choose a student --</option>
+              {students.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name} ({s.course || 'General'})
+                </option>
+              ))}
+            </Select>
+
+            {(() => {
+              const sel = students.find((s) => s.id === assignForm.studentId);
+              if (!sel) return null;
+              return (
+                <div className="mt-2 p-2.5 rounded-xl bg-indigo-50/80 dark:bg-indigo-950/40 border border-indigo-200/80 dark:border-indigo-800/80 text-xs text-indigo-900 dark:text-indigo-200 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="font-bold text-slate-900 dark:text-white">{sel.name}</span>
+                    <span className="text-indigo-600 dark:text-indigo-400">· Enrolled Course: <strong>{sel.course || 'Regular Training'}</strong></span>
+                  </div>
+                  <div className="font-extrabold text-indigo-700 dark:text-indigo-300">
+                    Standard Fee: ₹{sel.monthlyFee || 0}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+
+          <div>
+            <Select
+              label="Select Course / Fee Plan *"
+              value={assignForm.feePlanId}
+              onChange={(e) => handlePlanSelect(e.target.value)}
+            >
+              {(() => {
+                const sel = students.find((s) => s.id === assignForm.studentId);
+                return (
+                  <>
+                    {sel && sel.course && (
+                      <option value="STUDENT_COURSE">
+                        🎯 Current Enrolled Course: {sel.course} (₹{sel.monthlyFee || 0})
+                      </option>
+                    )}
+                    <option value="">-- Select Course / Training Plan --</option>
+                    {feePlans
+                      .filter((p) => p.active)
+                      .map((p) => (
+                        <option key={p.id} value={p.id}>
+                          🥋 {p.name} — ₹{p.amount} / {p.frequency}
+                        </option>
+                      ))}
+                    <option value="CUSTOM">✏️ Custom Course / Direct Amount</option>
+                  </>
+                );
+              })()}
+            </Select>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Select
+              label="Billing Period / Month *"
+              required
+              value={assignForm.billingPeriod}
+              onChange={(e) => setAssignForm({ ...assignForm, billingPeriod: e.target.value })}
+            >
+              {monthlyPeriodOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </Select>
+            <Input
+              label="Amount Due (₹) *"
+              type="number"
+              step="0.01"
+              min="0"
+              required
+              placeholder="e.g. 700"
+              value={assignForm.amountDue}
+              onChange={(e) => setAssignForm({ ...assignForm, amountDue: e.target.value })}
+            />
+          </div>
+
+          <Input
+            label="Due Date *"
+            type="date"
+            required
+            value={assignForm.dueDate}
+            onChange={(e) => setAssignForm({ ...assignForm, dueDate: e.target.value })}
+          />
+
+          <div className="flex justify-end gap-2.5 pt-4 border-t border-slate-100 dark:border-slate-800">
+            <Button type="button" variant="outline" onClick={() => setIsAssignModalOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={submitting}>
+              {submitting ? 'Assigning...' : 'Assign Fee'}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Modal 3: Record Payment */}
+      <Modal isOpen={isPayModalOpen} onClose={() => setIsPayModalOpen(false)} title="Record Fee Payment">
+        <form onSubmit={handleRecordPayment} className="space-y-4">
+          {modalSuccessMessage && (
+            <div className="p-3.5 bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200 text-sm rounded-xl flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
+              <span>{modalSuccessMessage}</span>
+            </div>
+          )}
+
+          <div className="p-4 bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl space-y-2 text-xs">
+            <div className="flex justify-between">
+              <span className="text-slate-500 dark:text-slate-400 font-medium">Student:</span>
+              <span className="font-bold text-slate-800 dark:text-white">{selectedFee?.student?.name}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-500 dark:text-slate-400 font-medium">Fee Period / Package:</span>
+              <span className="font-semibold text-slate-700 dark:text-slate-300">{selectedFee?.billing_period}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-500 dark:text-slate-400 font-medium">Total Package Fee:</span>
+              <span className="font-semibold text-slate-800 dark:text-white">₹{Number(selectedFee?.amount_due || 0).toLocaleString('en-IN')}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-500 dark:text-slate-400 font-medium">Paid So Far:</span>
+              <span className="font-semibold text-emerald-600 dark:text-emerald-400">₹{Number(selectedFee?.amount_paid || 0).toLocaleString('en-IN')}</span>
+            </div>
+            <div className="flex justify-between pt-1 border-t border-slate-200 dark:border-slate-700">
+              <span className="text-slate-700 dark:text-slate-300 font-bold">Current Remaining Due:</span>
+              <span className="font-bold text-sm text-amber-600 dark:text-amber-400 font-mono">₹{Number(selectedFee?.pending_amount || 0).toLocaleString('en-IN')}</span>
+            </div>
+          </div>
+
+          <div>
+            <Input
+              label="Installment Payment Amount (₹) *"
+              type="number"
+              step="0.01"
+              min="1"
+              max={selectedFee?.pending_amount}
+              required
+              value={payForm.amount}
+              onChange={(e) => setPayForm({ ...payForm, amount: e.target.value })}
+              placeholder={`Enter amount up to ₹${selectedFee?.pending_amount}`}
+            />
+            {Number(payForm.amount) > 0 && selectedFee && (
+              <div className="mt-2.5 p-3 rounded-xl bg-indigo-50/70 dark:bg-indigo-950/40 border border-indigo-200/80 dark:border-indigo-800/60 text-xs space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-600 dark:text-slate-400 font-medium">
+                    New Remaining Balance After This Payment:
+                  </span>
+                  <span className="font-bold font-mono text-indigo-700 dark:text-indigo-300">
+                    {Number(payForm.amount) >= Number(selectedFee.pending_amount)
+                      ? '₹0 (100% Fully Settled!)'
+                      : `₹${Math.max(0, Number(selectedFee.pending_amount) - Number(payForm.amount)).toLocaleString('en-IN')}`}
+                  </span>
+                </div>
+
+                {Number(payForm.amount) < Number(selectedFee.pending_amount) && (
+                  <div className="pt-2 border-t border-indigo-200/50 dark:border-indigo-800/40 space-y-1">
+                    <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300">
+                      📅 Next Installment Due Date (Agli Kist Ki Date)
+                    </label>
+                    <input
+                      type="date"
+                      value={payForm.nextDueDate}
+                      min={new Date().toISOString().split('T')[0]}
+                      onChange={(e) => setPayForm({ ...payForm, nextDueDate: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                    <p className="text-[10px] text-slate-400">
+                      Agli kist ka reminder aur ledger is date ke hisab se set ho jayega.
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Payment Date Input */}
+          <div>
+            <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+              📅 Payment Date (पावती / भरणा तारीख) *
+            </label>
+            <input
+              type="date"
+              required
+              value={payForm.paymentDate}
+              onChange={(e) => setPayForm({ ...payForm, paymentDate: e.target.value })}
+              className="w-full px-3 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium"
+            />
+            <p className="text-[11px] text-slate-400 mt-1">
+              या तारखेनुसार पावती व लेजरमध्ये एन्ट्री नोंदवली जाईल.
+            </p>
+          </div>
+
+          {/* Payment Mode Selector - Real Cash & UPI only */}
+          <div>
+            <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-2">
+              Payment Mode *
+            </label>
+            <div className="grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                onClick={() => setPayForm((prev) => ({ ...prev, provider: 'MANUAL', paymentMethod: 'CASH', notes: prev.notes || 'Cash payment received' }))}
+                className={`p-3 rounded-xl border flex items-center justify-center gap-2 font-bold text-xs transition-all cursor-pointer ${
+                  payForm.paymentMethod === 'CASH'
+                    ? 'border-emerald-500 bg-emerald-600 text-white shadow-md ring-2 ring-emerald-500/20'
+                    : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700/60'
+                }`}
+              >
+                <Banknote className="w-4 h-4 text-emerald-300" />
+                <span>Cash Payment</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setPayForm((prev) => ({ ...prev, provider: 'MANUAL', paymentMethod: 'UPI', notes: prev.notes || 'UPI payment received' }))}
+                className={`p-3 rounded-xl border flex items-center justify-center gap-2 font-bold text-xs transition-all cursor-pointer ${
+                  payForm.paymentMethod === 'UPI'
+                    ? 'border-indigo-500 bg-indigo-600 text-white shadow-md ring-2 ring-indigo-500/20'
+                    : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700/60'
+                }`}
+              >
+                <QrCode className="w-4 h-4 text-indigo-300" />
+                <span>UPI Payment</span>
+              </button>
+            </div>
+          </div>
+
+          <Input
+            label="Remarks / Notes (Optional)"
+            placeholder="e.g. Received by front desk receptionist"
+            value={payForm.notes}
+            onChange={(e) => setPayForm({ ...payForm, notes: e.target.value })}
+          />
+
+          <div className="flex justify-end gap-2.5 pt-4 border-t border-slate-100 dark:border-slate-800">
+            <Button type="button" variant="outline" onClick={() => setIsPayModalOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              disabled={submitting}
+              className={
+                payForm.provider === 'MANUAL' && payForm.paymentMethod === 'CASH'
+                  ? 'bg-emerald-600 hover:bg-emerald-700 text-white font-semibold gap-1.5 shadow-sm'
+                  : ''
+              }
+            >
+              {submitting
+                ? 'Processing...'
+                : payForm.provider === 'MANUAL' && payForm.paymentMethod === 'CASH'
+                ? `Receive Cash (₹${payForm.amount || '0'}) & Issue Receipt`
+                : 'Confirm Payment'}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* MODAL: Adjust Student Fee (Amount & Due Date) */}
+      <Modal
+        isOpen={isAdjustFeeModalOpen}
+        onClose={() => setIsAdjustFeeModalOpen(false)}
+        title={`Adjust Fee Dues: ${adjustingFee?.studentName || 'Student'}`}
+      >
+        <form onSubmit={handleSaveAdjustFee} className="space-y-4">
+          <Input
+            label="Total Amount Due (₹) *"
+            type="number"
+            min="1"
+            step="1"
+            value={adjustingFee?.amountDue || ''}
+            onChange={(e) => setAdjustingFee((prev) => prev ? { ...prev, amountDue: e.target.value } : null)}
+            required
+            placeholder="e.g. 10000"
+          />
+
+          <Input
+            label="Payment Due Date *"
+            type="date"
+            value={adjustingFee?.dueDate || ''}
+            onChange={(e) => setAdjustingFee((prev) => prev ? { ...prev, dueDate: e.target.value } : null)}
+            required
+          />
+
+          <div className="p-3 rounded-xl bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-800/60 text-xs text-indigo-800 dark:text-indigo-300">
+            💡 Adjusting the due date and fee amount will immediately update the student's receivables ledger and sync with automated WhatsApp fee reminders.
+          </div>
+
+          <div className="flex items-center justify-end gap-2.5 pt-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setIsAdjustFeeModalOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              disabled={adjustingLoading}
+              className="bg-indigo-600 hover:bg-indigo-700 text-white"
+            >
+              {adjustingLoading ? 'Saving...' : 'Update Fee Dues'}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* MODAL 6: Delete Student & Erase Records Confirmation */}
+      <Modal
+        isOpen={Boolean(studentToDeleteFromFees)}
+        onClose={() => setStudentToDeleteFromFees(null)}
+        title="Delete Student & Erase Records"
+        maxWidth="sm"
+      >
+        <div className="space-y-4">
+          <div className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-xs text-rose-800 dark:text-rose-200">
+            ⚠️ <strong>Permanent Action:</strong> You are about to permanently delete <strong>{studentToDeleteFromFees?.name}</strong> from Amit Academy.
+            This will permanently remove the student, their fee bills, payments, and attendance. Total expected fee, pending dues, and revenue totals will immediately recalculate.
+          </div>
+          <div className="flex justify-end gap-2.5 pt-2 border-t border-slate-200 dark:border-white/10">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setStudentToDeleteFromFees(null)}
+              disabled={deletingStudentFromFees}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={handleConfirmDeleteStudentFromFees}
+              disabled={deletingStudentFromFees}
+              className="bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs"
+            >
+              {deletingStudentFromFees ? 'Deleting...' : 'Yes, Delete Permanently'}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+};

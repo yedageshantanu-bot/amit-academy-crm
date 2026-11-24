@@ -1,0 +1,525 @@
+import React, { createContext, useContext, useEffect, useState } from 'react';
+import { supabase } from '../lib/supabase';
+import { getApiUrl, refreshTokenFromServer, isJwtExpired } from '../lib/api';
+import { AuthContextType, Role, UserProfile } from '../types/auth';
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [token, setToken] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('amit_access_token');
+    } catch {
+      return null;
+    }
+  });
+
+  const [profile, setProfile] = useState<UserProfile | null>(() => {
+    try {
+      const cached = localStorage.getItem('amit_user_profile');
+      return cached ? JSON.parse(cached) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [user, setUser] = useState<any | null>(() => {
+    try {
+      const cached = localStorage.getItem('amit_user_profile');
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        return { id: parsed.userId, email: parsed.email };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [loading, setLoading] = useState<boolean>(() => {
+    try {
+      const hasToken = !!localStorage.getItem('amit_access_token') || !!localStorage.getItem('amit_refresh_token');
+      return hasToken && !localStorage.getItem('amit_user_profile');
+    } catch {
+      return false;
+    }
+  });
+
+  // Fetch backend profile using verified Supabase JWT with server-side refresh and metadata fallback
+  const fetchBackendProfile = async (accessToken: string, userObj?: any): Promise<UserProfile | null> => {
+    try {
+      const controller = new AbortController();
+      const fetchTimer = setTimeout(() => controller.abort(), 12000);
+
+      const response = await fetch(getApiUrl('/auth/me'), {
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }).finally(() => clearTimeout(fetchTimer));
+
+      if (response.ok) {
+        const json = await response.json().catch(() => null);
+        if (json?.success && json?.data) {
+          return json.data as UserProfile;
+        }
+      } else if (response.status === 401) {
+        // Token expired - attempt server-side refresh first
+        const newToken = await refreshTokenFromServer();
+        if (newToken) {
+          return fetchBackendProfile(newToken, userObj);
+        }
+
+        const { data: refreshData } = await supabase.auth.refreshSession().catch(() => ({ data: null }));
+        if (refreshData?.session?.access_token) {
+          return fetchBackendProfile(refreshData.session.access_token, refreshData.session.user);
+        } else {
+          // Do NOT wipe tokens on refresh failure; check cached profile
+          try {
+            const cached = localStorage.getItem('amit_user_profile');
+            if (cached) return JSON.parse(cached) as UserProfile;
+          } catch {}
+          return null;
+        }
+      } else if (response.status === 403) {
+        const errJson = await response.json().catch(() => null);
+        if (errJson?.code === 'TRIAL_EXPIRED' || errJson?.message?.includes('trial has ended')) {
+          await supabase.auth.signOut().catch(() => {});
+          throw new Error('Your 3-day trial has ended. Please contact us to continue using Academy CRM.');
+        }
+      }
+    } catch (err: any) {
+      if (err.message?.includes('trial has ended')) {
+        throw err;
+      }
+      console.warn('Backend profile endpoint took too long or was unavailable; checking cached profile or metadata.');
+      
+      // If we have cached profile in localStorage, return it rather than killing the session!
+      try {
+        const cached = localStorage.getItem('amit_user_profile');
+        if (cached) {
+          return JSON.parse(cached) as UserProfile;
+        }
+      } catch {}
+    }
+
+    // Direct fallback from Supabase user session / metadata (essential for Cloudflare Pages preview)
+    const activeUser = userObj || user;
+    if (activeUser) {
+      const meta = activeUser.user_metadata || {};
+      const role = (meta.role || (activeUser.email?.includes('student') ? 'STUDENT' : activeUser.email?.includes('teacher') ? 'TEACHER' : 'ADMIN')) as Role;
+      const fullName = meta.full_name || (role === 'STUDENT' ? (meta.student_name || 'Academy Student') : role === 'ADMIN' ? 'Academy Administrator' : 'Lead Instructor');
+
+      return {
+        userId: activeUser.id,
+        profileId: activeUser.id,
+        email: activeUser.email || '',
+        fullName,
+        role,
+        teacherId: meta.teacherId || (role === 'TEACHER' ? activeUser.id : undefined),
+        studentId: meta.student_id || (role === 'STUDENT' ? activeUser.id : undefined),
+        phone: meta.phone,
+      };
+    }
+
+    return null;
+  };
+
+  // Initialize session on mount and listen to auth changes (Session Persistence)
+  useEffect(() => {
+    let isMounted = true;
+
+    // Safety fallback: Never keep loading screen up for more than 2.5s
+    const safetyTimeout = setTimeout(() => {
+      if (isMounted) {
+        setLoading(false);
+      }
+    }, 2500);
+
+    const initializeAuth = async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession().catch(() => ({ data: { session: null } }));
+
+        let tokenToVerify = session?.access_token;
+        let activeUser = session?.user;
+
+        if (!tokenToVerify) {
+          try {
+            const cachedToken = localStorage.getItem('amit_access_token');
+            if (cachedToken) {
+              tokenToVerify = cachedToken;
+            }
+          } catch {}
+        }
+
+        // If token exists but is expired, attempt immediate refresh before profile fetch
+        if (tokenToVerify && isJwtExpired(tokenToVerify, 30)) {
+          const refreshed = await refreshTokenFromServer();
+          if (refreshed) {
+            tokenToVerify = refreshed;
+          }
+        }
+
+        if (!tokenToVerify) {
+          // Attempt session recovery via persistent refresh token!
+          try {
+            const cachedRefresh = localStorage.getItem('amit_refresh_token');
+            if (cachedRefresh) {
+              const refreshed = await refreshTokenFromServer();
+              if (refreshed) {
+                tokenToVerify = refreshed;
+              }
+            }
+          } catch {}
+        }
+
+        if (!tokenToVerify) {
+          // If we still have cached profile, keep user logged in!
+          try {
+            const cached = localStorage.getItem('amit_user_profile');
+            if (cached && isMounted) {
+              const parsed = JSON.parse(cached);
+              setProfile(parsed);
+              setUser({ id: parsed.userId, email: parsed.email });
+              setLoading(false);
+              return;
+            }
+          } catch {}
+
+          if (isMounted) {
+            setUser(null);
+            setProfile(null);
+            setToken(null);
+            setLoading(false);
+          }
+          return;
+        }
+
+        if (isMounted) {
+          setToken(tokenToVerify);
+          if (activeUser) setUser(activeUser);
+        }
+
+        const backendProfile = await fetchBackendProfile(tokenToVerify, activeUser);
+        if (isMounted) {
+          if (backendProfile) {
+            setProfile(backendProfile);
+            setUser({ id: backendProfile.userId, email: backendProfile.email });
+            try {
+              localStorage.setItem('amit_access_token', tokenToVerify);
+              localStorage.setItem('amit_user_profile', JSON.stringify(backendProfile));
+            } catch {}
+          } else {
+            // Keep cached profile if available; never wipe on background check
+            const cachedProfileStr = localStorage.getItem('amit_user_profile');
+            if (cachedProfileStr) {
+              try {
+                const parsed = JSON.parse(cachedProfileStr);
+                setProfile(parsed);
+                setUser({ id: parsed.userId, email: parsed.email });
+              } catch {}
+            }
+          }
+          setLoading(false);
+        }
+      } catch (err) {
+        console.error('Auth initialization error:', err);
+        if (isMounted) {
+          setLoading(false);
+        }
+      } finally {
+        clearTimeout(safetyTimeout);
+      }
+    };
+
+    initializeAuth();
+
+    // Listen to token refresh events emitted by apiClient / authFetch
+    const handleTokenRefreshed = (e: any) => {
+      const refreshedToken = e.detail?.token;
+      if (refreshedToken && isMounted) {
+        setToken(refreshedToken);
+      }
+    };
+    window.addEventListener('amit:token_refreshed', handleTokenRefreshed);
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      async (_event, session) => {
+        try {
+          if (session) {
+            setUser(session.user);
+            setToken(session.access_token);
+            try {
+              localStorage.setItem('amit_access_token', session.access_token);
+              if (session.refresh_token) {
+                localStorage.setItem('amit_refresh_token', session.refresh_token);
+              }
+            } catch {}
+
+            // Check if profile already exists in localStorage for this user
+            let resolvedProfile: UserProfile | null = null;
+            try {
+              const cached = localStorage.getItem('amit_user_profile');
+              if (cached) {
+                const parsed = JSON.parse(cached);
+                if (parsed.userId === session.user.id || parsed.email === session.user.email) {
+                  resolvedProfile = parsed;
+                  if (isMounted) setProfile(parsed);
+                }
+              }
+            } catch {}
+
+            // If not cached, fetch backend profile
+            if (!resolvedProfile) {
+              const backendProfile = await fetchBackendProfile(session.access_token, session.user);
+              if (backendProfile && isMounted) {
+                setProfile(backendProfile);
+                try {
+                  localStorage.setItem('amit_user_profile', JSON.stringify(backendProfile));
+                } catch {}
+              }
+            }
+          } else {
+            // If session is null / signed out
+            if (_event === 'SIGNED_OUT') {
+              if (isMounted) {
+                setUser(null);
+                setProfile(null);
+                setToken(null);
+              }
+            } else {
+              const cachedProfile = localStorage.getItem('amit_user_profile');
+              if (!cachedProfile && isMounted) {
+                setUser(null);
+                setProfile(null);
+                setToken(null);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('onAuthStateChange error handled:', e);
+        } finally {
+          if (isMounted) {
+            setLoading(false);
+          }
+        }
+      }
+    );
+
+    return () => {
+      isMounted = false;
+      window.removeEventListener('amit:token_refreshed', handleTokenRefreshed);
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  const login = async (email: string, password: string): Promise<{ role: Role }> => {
+    setLoading(true);
+    try {
+      // 1. Primary: Use backend /api/auth/login endpoint (verified fast & robust)
+      try {
+        const response = await fetch(getApiUrl('/auth/login'), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ email, password }),
+        });
+
+        if (response.ok) {
+          const json = await response.json();
+          if (json?.success && json?.data) {
+            const { token: jwtToken, refreshToken, user: authUser } = json.data;
+            if (jwtToken) {
+              setToken(jwtToken);
+              try {
+                localStorage.setItem('amit_access_token', jwtToken);
+                if (refreshToken) {
+                  localStorage.setItem('amit_refresh_token', refreshToken);
+                }
+              } catch {}
+              setUser({ id: authUser.id, email: authUser.email });
+
+              const userProf: UserProfile = {
+                userId: authUser.id,
+                profileId: authUser.id,
+                email: authUser.email,
+                fullName: authUser.fullName,
+                role: authUser.role,
+                teacherId: authUser.teacherId,
+                isTrial: authUser.isTrial,
+                daysRemaining: authUser.daysRemaining,
+              };
+              setProfile(userProf);
+              try {
+                localStorage.setItem('amit_user_profile', JSON.stringify(userProf));
+              } catch {}
+
+              // Sync session with Supabase client in background
+              if (refreshToken) {
+                supabase.auth.setSession({
+                  access_token: jwtToken,
+                  refresh_token: refreshToken,
+                }).catch(() => {});
+              }
+
+              return { role: userProf.role };
+            }
+          }
+        } else {
+          const errJson = await response.json().catch(() => ({}));
+          const errMsg = errJson?.error?.message || errJson?.message;
+          if (errMsg && (response.status === 401 || response.status === 403)) {
+            throw new Error(errMsg);
+          }
+        }
+      } catch (backendErr: any) {
+        if (
+          backendErr.message?.includes('Invalid email') ||
+          backendErr.message?.includes('deactivated') ||
+          backendErr.message?.includes('trial')
+        ) {
+          throw backendErr;
+        }
+        console.warn('Backend login endpoint unavailable; attempting direct Supabase login.', backendErr);
+      }
+
+      // 2. Direct Supabase Auth Fallback
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+
+      if (error || !data.session) {
+        throw new Error(error?.message || 'Invalid email or password.');
+      }
+
+      setUser(data.user);
+      setToken(data.session.access_token);
+      try {
+        localStorage.setItem('amit_access_token', data.session.access_token);
+        if (data.session.refresh_token) {
+          localStorage.setItem('amit_refresh_token', data.session.refresh_token);
+        }
+      } catch {}
+
+      const backendProfile = await fetchBackendProfile(data.session.access_token, data.user);
+      if (!backendProfile) {
+        await supabase.auth.signOut().catch(() => {});
+        throw new Error('User profile record not found or inactive. Contact the administrator.');
+      }
+
+      setProfile(backendProfile);
+      try {
+        localStorage.setItem('amit_user_profile', JSON.stringify(backendProfile));
+      } catch {}
+      return { role: backendProfile.role };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const studentLogin = async (identifier: string, passwordInput: string): Promise<{ role: Role }> => {
+    setLoading(true);
+    try {
+      const response = await fetch(getApiUrl('/student-portal/auth/login'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier, password: passwordInput }),
+      });
+
+      const resData = await response.json();
+      if (!response.ok || !resData.success) {
+        throw new Error(resData.message || resData.error || 'Student login failed.');
+      }
+
+      const { token: accessToken, refreshToken, user: authUser, student } = resData.data;
+
+      const studentProfile: UserProfile = {
+        userId: authUser.id,
+        profileId: authUser.id,
+        email: authUser.email,
+        fullName: authUser.fullName || student?.name || 'Academy Student',
+        role: 'STUDENT',
+        studentId: authUser.studentId || student?.id,
+        phone: authUser.phone || student?.student_mobile,
+      };
+
+      setUser({ id: authUser.id, email: authUser.email });
+      setToken(accessToken);
+      setProfile(studentProfile);
+
+      try {
+        localStorage.setItem('amit_access_token', accessToken);
+        if (refreshToken) {
+          localStorage.setItem('amit_refresh_token', refreshToken);
+        }
+        localStorage.setItem('amit_user_profile', JSON.stringify(studentProfile));
+      } catch {}
+
+      if (accessToken && refreshToken) {
+        supabase.auth.setSession({
+          access_token: accessToken,
+          refresh_token: refreshToken,
+        }).catch(() => {});
+      }
+
+      return { role: 'STUDENT' };
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const logout = async (): Promise<void> => {
+    try {
+      setLoading(false);
+      localStorage.removeItem('amit_access_token');
+      localStorage.removeItem('amit_refresh_token');
+      localStorage.removeItem('amit_user_profile');
+      try {
+        sessionStorage.clear();
+      } catch {}
+      await supabase.auth.signOut().catch(() => {});
+      await fetch(getApiUrl('/auth/logout'), { method: 'POST' }).catch(() => {});
+    } finally {
+      setUser(null);
+      setProfile(null);
+      setToken(null);
+      setLoading(false);
+      window.location.href = '/login';
+    }
+  };
+
+  const resetPassword = async (email: string): Promise<void> => {
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: `${window.location.origin}/login`,
+    });
+
+    if (error) {
+      throw new Error(error.message);
+    }
+  };
+
+  const value: AuthContextType = {
+    user,
+    profile,
+    role: profile?.role || null,
+    token,
+    loading,
+    isAuthenticated: !!user && !!profile,
+    login,
+    studentLogin,
+    logout,
+    resetPassword,
+  };
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+};
+
+export const useAuth = (): AuthContextType => {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+};

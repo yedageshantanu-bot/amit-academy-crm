@@ -1,0 +1,442 @@
+import { Request, Response, NextFunction } from 'express';
+import { supabaseAdmin } from '../config/supabase.js';
+
+export class TeamMessageController {
+  async listTeamMessages(_req: Request, res: Response, next: NextFunction) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('team_messages')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+
+      res.status(200).json({
+        success: true,
+        data: data || [],
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async createTeamMessage(req: Request, res: Response, next: NextFunction) {
+    try {
+      const {
+        senderName,
+        senderPosition,
+        recipientRole,
+        subject,
+        message,
+        priority,
+        status,
+        isDraft,
+      } = req.body;
+
+      if (!message || !message.trim()) {
+        res.status(400).json({ success: false, message: 'Message content is required.' });
+        return;
+      }
+
+      const finalStatus = (isDraft === true || status === 'DRAFT') ? 'DRAFT' : 'SENT';
+
+      const { data, error } = await supabaseAdmin
+        .from('team_messages')
+        .insert({
+          sender_name: senderName ? senderName.trim() : null,
+          sender_position: senderPosition ? senderPosition.trim() : null,
+          recipient_role: recipientRole || 'ALL_STAFF',
+          subject: subject ? subject.trim() : null,
+          message: message.trim(),
+          priority: priority || 'NORMAL',
+          status: finalStatus,
+        })
+        .select('*')
+        .single();
+
+      if (error) throw error;
+
+      res.status(201).json({
+        success: true,
+        message: 'Team message dispatched and stored successfully',
+        data,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async updateTeamMessage(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { id } = req.params;
+      const { message, subject, priority, status, recipient_role, sender_name } = req.body;
+
+      const updateData: any = {};
+      if (message !== undefined) updateData.message = message.trim();
+      if (subject !== undefined) updateData.subject = subject ? subject.trim() : null;
+      if (priority !== undefined) updateData.priority = priority;
+      if (status !== undefined) updateData.status = status;
+      if (recipient_role !== undefined) updateData.recipient_role = recipient_role;
+      if (sender_name !== undefined) updateData.sender_name = sender_name ? sender_name.trim() : null;
+
+      const { data, error } = await supabaseAdmin
+        .from('team_messages')
+        .update(updateData)
+        .eq('id', id)
+        .select('*')
+        .single();
+
+      if (error) throw error;
+
+      res.status(200).json({
+        success: true,
+        message: 'Team message updated successfully',
+        data,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async deleteTeamMessage(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { id } = req.params;
+      const { error } = await supabaseAdmin
+        .from('team_messages')
+        .delete()
+        .eq('id', id);
+
+      if (error) throw error;
+
+      res.status(200).json({
+        success: true,
+        message: 'Team message removed successfully',
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  // ==========================================
+  // TEAMS (GROUPS / CATEGORIES)
+  // ==========================================
+
+  async listTeams(_req: Request, res: Response, next: NextFunction) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('teams')
+        .select('*')
+        .order('created_at', { ascending: true });
+
+      if (error) throw error;
+
+      res.status(200).json({
+        success: true,
+        data: data || [],
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async createTeam(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { name, code, marathiName, description, color } = req.body;
+
+      if (!name || !name.trim()) {
+        res.status(400).json({ success: false, message: 'Team name is required.' });
+        return;
+      }
+
+      const generatedCode = (code && code.trim())
+        ? code.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_')
+        : name.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_').substring(0, 30);
+
+      const { data, error } = await supabaseAdmin
+        .from('teams')
+        .insert({
+          name: name.trim(),
+          code: generatedCode,
+          marathi_name: marathiName ? marathiName.trim() : null,
+          description: description ? description.trim() : null,
+          color: color || 'indigo',
+        })
+        .select('*')
+        .single();
+
+      if (error) {
+        if (error.code === '23505') {
+          res.status(400).json({ success: false, message: `Team with code "${generatedCode}" already exists.` });
+          return;
+        }
+        throw error;
+      }
+
+      res.status(201).json({
+        success: true,
+        message: 'New team created successfully',
+        data,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async updateTeam(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { id } = req.params;
+      const { name, code, marathiName, description, color } = req.body;
+
+      if (!name || !name.trim()) {
+        res.status(400).json({ success: false, message: 'Team name is required.' });
+        return;
+      }
+
+      const updates: any = {
+        name: name.trim(),
+        updated_at: new Date().toISOString(),
+      };
+      if (code && code.trim()) {
+        updates.code = code.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+      }
+      if (marathiName !== undefined) updates.marathi_name = marathiName ? marathiName.trim() : null;
+      if (description !== undefined) updates.description = description ? description.trim() : null;
+      if (color !== undefined) updates.color = color;
+
+      const { data, error } = await supabaseAdmin
+        .from('teams')
+        .update(updates)
+        .eq('id', id)
+        .select('*')
+        .single();
+
+      if (error) {
+        if (error.code === '23505') {
+          res.status(400).json({ success: false, message: 'Team with code already exists.' });
+          return;
+        }
+        throw error;
+      }
+
+      res.status(200).json({
+        success: true,
+        message: 'Team updated successfully',
+        data,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async deleteTeam(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { id } = req.params;
+
+      // 1. Look up team code before deletion to clean up enrolled members
+      const { data: team } = await supabaseAdmin
+        .from('teams')
+        .select('code')
+        .eq('id', id)
+        .maybeSingle();
+
+      if (team?.code) {
+        // Cascade remove all team members belonging to this deleted team
+        await supabaseAdmin
+          .from('team_members')
+          .delete()
+          .eq('team_code', team.code);
+      }
+
+      const { error } = await supabaseAdmin
+        .from('teams')
+        .delete()
+        .eq('id', id);
+
+      if (error) throw error;
+
+      res.status(200).json({
+        success: true,
+        message: 'Team and all enrolled members removed successfully',
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  // ==========================================
+  // TEAM MEMBERS
+  // ==========================================
+
+  async listTeamMembers(req: Request, res: Response, next: NextFunction) {
+    try {
+      let query = supabaseAdmin
+        .from('team_members')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      const teamCode = req.query.teamCode as string;
+      if (teamCode && teamCode !== 'ALL') {
+        query = query.eq('team_code', teamCode);
+      }
+
+      const { data, error } = await query;
+      if (error) throw error;
+
+      res.status(200).json({
+        success: true,
+        data: data || [],
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async createTeamMember(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { name, phone, position, teamCode, district, notes } = req.body;
+
+      if (!phone || !phone.trim()) {
+        res.status(400).json({ success: false, message: 'Phone/WhatsApp number is required.' });
+        return;
+      }
+
+      // Default to 'ALL' if no specific team is selected (Direct All Members)
+      const targetTeamCode = (teamCode && teamCode.trim()) ? teamCode.trim() : 'ALL';
+
+      const clean10 = phone.trim().replace(/[^0-9]/g, '').slice(-10);
+      if (clean10) {
+        const { data: existingMembers } = await supabaseAdmin
+          .from('team_members')
+          .select('id, phone')
+          .eq('team_code', targetTeamCode);
+
+        const isDuplicateInTeam = (existingMembers || []).some(
+          (m) => m.phone && m.phone.replace(/[^0-9]/g, '').slice(-10) === clean10
+        );
+
+        if (isDuplicateInTeam) {
+          res.status(400).json({
+            success: false,
+            message: targetTeamCode === 'ALL'
+              ? 'This contact is already in All Members directory.'
+              : 'This contact is already enrolled in this team.',
+          });
+          return;
+        }
+      }
+
+      const { data, error } = await supabaseAdmin
+        .from('team_members')
+        .insert({
+          name: name ? name.trim() : null,
+          phone: phone.trim(),
+          position: position ? position.trim() : null,
+          team_code: targetTeamCode,
+          district: district ? district.trim() : null,
+          notes: notes ? notes.trim() : null,
+          status: 'ACTIVE',
+        })
+        .select('*')
+        .single();
+
+      if (error) throw error;
+
+      res.status(201).json({
+        success: true,
+        message: targetTeamCode === 'ALL' ? 'Contact added to All Members successfully' : 'Team member added successfully',
+        data,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async deleteTeamMember(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { id } = req.params;
+      const allTeams = req.query.allTeams === 'true' || req.query.byPhone === 'true';
+      const phoneParam = ((req.query.phone as string) || (req.body?.phone as string) || '').trim();
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+
+      let clean10 = phoneParam ? phoneParam.replace(/[^0-9]/g, '').slice(-10) : '';
+
+      if (!clean10 && !isUuid) {
+        const digits = id.replace(/[^0-9]/g, '');
+        if (digits.length >= 10) {
+          clean10 = digits.slice(-10);
+        }
+      }
+
+      // ONLY delete across all teams when explicitly requested (e.g. from All Members tab)
+      if (allTeams) {
+        if (!clean10 && isUuid) {
+          const { data: member } = await supabaseAdmin
+            .from('team_members')
+            .select('id, phone')
+            .eq('id', id)
+            .maybeSingle();
+
+          if (member?.phone) {
+            clean10 = member.phone.replace(/[^0-9]/g, '').slice(-10);
+          }
+        }
+
+        if (clean10) {
+          const { data: allMembers } = await supabaseAdmin
+            .from('team_members')
+            .select('id, phone');
+
+          const idsToDelete = (allMembers || [])
+            .filter((m) => m.phone && m.phone.replace(/[^0-9]/g, '').slice(-10) === clean10)
+            .map((m) => m.id);
+
+          if (isUuid && !idsToDelete.includes(id)) {
+            idsToDelete.push(id);
+          }
+
+          if (idsToDelete.length > 0) {
+            const { error } = await supabaseAdmin
+              .from('team_members')
+              .delete()
+              .in('id', idsToDelete);
+
+            if (error) throw error;
+          }
+
+          res.status(200).json({
+            success: true,
+            message: 'Contact permanently removed from all teams and directory',
+          });
+          return;
+        }
+      }
+
+      // Single-team deletion: remove ONLY the specific team member record
+      if (isUuid) {
+        const { error } = await supabaseAdmin
+          .from('team_members')
+          .delete()
+          .eq('id', id);
+
+        if (error) throw error;
+      } else if (clean10 && req.query.teamCode) {
+        const { error } = await supabaseAdmin
+          .from('team_members')
+          .delete()
+          .eq('team_code', String(req.query.teamCode))
+          .ilike('phone', `%${clean10}%`);
+
+        if (error) throw error;
+      }
+
+      res.status(200).json({
+        success: true,
+        message: 'Team member removed from squad successfully',
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+}
+
+export const teamMessageController = new TeamMessageController();

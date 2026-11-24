@@ -1,0 +1,1715 @@
+import crypto from 'crypto';
+import { supabaseAdmin } from '../../config/supabase.js';
+import { AppError } from '../../middlewares/errorHandler.js';
+import { whatsappProviderFactory } from './whatsappProvider.factory.js';
+import { whatsappSettingsService } from './whatsappSettings.service.js';
+import { env } from '../../config/env.js';
+import { requestContext } from '../../config/requestContext.js';
+import { ROLES } from '../../constants/index.js';
+import {
+  WhatsAppQueueItem,
+  WhatsAppQueueStatus,
+  QueueFilterQuery,
+  TodayStats,
+} from '../../types/whatsapp.types.js';
+import { feeService } from '../fee.service.js';
+import { recipientSecurityService } from './recipientSecurity.service.js';
+
+export interface EnqueueMessageParams {
+  recipientPhone: string;
+  messageBody: string;
+  studentId?: string | null;
+  templateId?: string | null;
+  eventType?: string;
+  scheduledAt?: string;
+  idempotencyKey?: string;
+  metadata?: Record<string, any>;
+}
+
+/**
+ * Block dummy, placeholder, and demo numbers from ever reaching live WhatsApp.
+ * Protects real mobile subscribers from unintended messages.
+ * Whitelists the verified admin testing phone (+919404849500).
+ */
+export function isBlockedOrDummyNumber(phone: string): boolean {
+  if (!phone) return true;
+  const digits = phone.replace(/[^\d]/g, '');
+  const last10 = digits.length >= 10 ? digits.slice(-10) : digits;
+
+  // Reject numbers with less than 10 digits or more than 15 digits (E.164 boundary)
+  if (digits.length < 10 || digits.length > 15) return true;
+
+  // Always allow verified admin testing phone
+  if (last10 === '9404849500' || digits === '919404849500') {
+    return false;
+  }
+
+  // Identify Indian phone numbers (10 digits, or prefixed with 91, 0, or +91)
+  const isIndian =
+    digits.length === 10 ||
+    (digits.length === 11 && digits.startsWith('0')) ||
+    (digits.length === 12 && digits.startsWith('91')) ||
+    (digits.length === 13 && digits.startsWith('910')) ||
+    phone.trim().startsWith('+91');
+
+  if (isIndian) {
+    // Valid Indian mobile numbers MUST begin with 6, 7, 8, or 9
+    if (!/^[6-9]\d{9}$/.test(last10)) {
+      return true;
+    }
+  }
+
+  // Block common demo and test numbers from sample seeds
+  const knownDummies = [
+    '9876500001', '9876500002', '9876500003', '9876500004', '9876500005',
+    '9888877777', '9123456780', '9876543210',
+    '0000000000', '1234567890', '9999999999', '1111111111', '2222222222',
+    '9100000000', '9111122222',
+  ];
+  if (knownDummies.includes(last10)) return true;
+
+  // Block repeating digits (e.g. 0000000000, 9999999999, 8888888888)
+  if (/^(\d)\1{9}$/.test(last10)) return true;
+
+  // Block sequential ascending / descending
+  if (last10 === '1234567890' || last10 === '0123456789' || last10 === '9876543210' || last10 === '8765432109') return true;
+
+  // Block common demo/test invalid prefix patterns
+  if (last10.startsWith('000000')) {
+    return true;
+  }
+
+  return false;
+}
+
+export class WhatsAppQueueService {
+  private inMemoryQueue: Map<string, WhatsAppQueueItem> = new Map();
+  private processingRecipients: Set<string> = new Set();
+  private inFlightItemIds: Set<string> = new Set();
+  private recentDispatchedMap: Map<string, number> = new Map();
+  private lastDispatchedAt: number = 0;
+  public readonly MIN_DISPATCH_INTERVAL_MS = 3500; // Anti-ban humanized throttle (3.5s - 5.5s)
+
+  private get supabase() {
+    return supabaseAdmin;
+  }
+
+  /**
+   * Block dummy, placeholder, and demo numbers from ever reaching live WhatsApp.
+   * Protects real mobile subscribers from unintended messages.
+   * Whitelists the verified admin testing phone (+919404849500).
+   */
+  isBlockedOrDummyNumber(phone: string): boolean {
+    return isBlockedOrDummyNumber(phone);
+  }
+
+  // Normalize phone number to standard format (handles Indian numbers, leading zeros, +91)
+  normalizePhoneNumber(phone: string): string {
+    let digits = phone.replace(/[^\d+]/g, '');
+    if (digits.startsWith('+')) digits = digits.slice(1);
+    if (digits.startsWith('0') && digits.length === 11) {
+      digits = digits.slice(1);
+    }
+    if (digits.length === 10) return `+91${digits}`;
+    if (digits.length === 12 && digits.startsWith('91')) return `+${digits}`;
+    return `+${digits}`;
+  }
+
+  // Generate idempotency key for deduplication
+  generateIdempotencyKey(phone: string, eventType: string, body: string): string {
+    const raw = `${phone.trim()}_${eventType.trim()}_${body.trim()}`;
+    return crypto.createHash('sha256').update(raw).digest('hex').substring(0, 32);
+  }
+
+  // Stagger an array of messages so they dispatch with a humanized 2.8 - 4.2 second gap between each recipient
+  async enqueueBatchStaggered(
+    items: EnqueueMessageParams[],
+    baseIntervalMs: number = 2800,
+    startFromTimestamp?: number
+  ): Promise<WhatsAppQueueItem[]> {
+    if (env.DEMO_MODE || env.APP_ENV === 'demo' || !env.WHATSAPP_ENABLED) {
+      console.log('[QueueService] WhatsApp is disabled in environment. Skipping batch enqueue.');
+      return [];
+    }
+
+    const results: WhatsAppQueueItem[] = [];
+    let currentSchedule = startFromTimestamp || Date.now();
+
+    for (let i = 0; i < items.length; i++) {
+      if (i > 0) {
+        // Add random jitter of 0.5 - 1.5 seconds to prevent robotic periodic patterns
+        const jitter = Math.floor(Math.random() * 1200);
+        currentSchedule += baseIntervalMs + jitter;
+      }
+      const scheduledTime = new Date(currentSchedule).toISOString();
+      const queued = await this.enqueueMessage({
+        ...items[i],
+        scheduledAt: scheduledTime,
+      });
+      results.push(queued);
+    }
+
+    return results;
+  }
+
+  // ============================================================================
+  // 1. ENQUEUE MESSAGE (With Duplicate Insertion Protection)
+  async enqueueMessage(params: EnqueueMessageParams): Promise<WhatsAppQueueItem> {
+    if (!env.WHATSAPP_ENABLED) {
+      console.log('[QueueService] WhatsApp is disabled in environment. Message enqueue refused.');
+      return {
+        id: crypto.randomUUID(),
+        recipient_phone: this.normalizePhoneNumber(params.recipientPhone),
+        student_id: params.studentId || null,
+        template_id: params.templateId || null,
+        event_type: params.eventType || 'DEMO_DISCARDED',
+        message_body: params.messageBody,
+        scheduled_at: new Date().toISOString(),
+        status: 'FAILED',
+        attempts: 0,
+        max_attempts: 0,
+        sent_at: null,
+        failure_reason: 'WhatsApp automation is disabled in client trial demo mode.',
+        idempotency_key: 'demo-discarded',
+        provider_message_id: null,
+        metadata: {},
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+    }
+
+    const normalizedPhone = this.normalizePhoneNumber(params.recipientPhone);
+    const eventType = params.eventType || 'CUSTOM_NOTIFICATION';
+    const idempotencyKey =
+      params.idempotencyKey || this.generateIdempotencyKey(normalizedPhone, eventType, params.messageBody);
+
+    // Duplicate guard: reject duplicate send only if an active (non-stale) item is currently queued or in-flight
+    const nowMs = Date.now();
+    for (const item of this.inMemoryQueue.values()) {
+      if (item.idempotency_key === idempotencyKey) {
+        if (item.status === 'PENDING' || item.status === 'PROCESSING') {
+          const itemSchedMs = new Date(item.scheduled_at || 0).getTime();
+          const isStale = (nowMs - itemSchedMs > 30 * 60 * 1000) && item.status === 'PENDING';
+          if (isStale) {
+            item.status = 'FAILED';
+            item.failure_reason = 'Stale delivery window expired (superseded)';
+            item.updated_at = new Date().toISOString();
+          } else {
+            console.log(`[QueueService] Message is already queued and waiting for dispatch to ${normalizedPhone}. Halting duplicate.`);
+            throw new AppError('Message is already queued and waiting for dispatch', 409, 'DUPLICATE_MESSAGE');
+          }
+        } else if (item.status === 'SENT') {
+          const sentTime = new Date(item.sent_at || item.updated_at || 0).getTime();
+          if (nowMs - sentTime < 10 * 60 * 1000) {
+            console.log(`[QueueService] Identical message already sent to ${normalizedPhone} recently. Halting duplicate.`);
+            throw new AppError('Message has already been sent to this recipient recently', 409, 'DUPLICATE_MESSAGE');
+          }
+        }
+      }
+    }
+
+    if (this.supabase) {
+      try {
+        const { data: existing } = await this.supabase
+          .from('whatsapp_queue')
+          .select('id, status, scheduled_at, sent_at, updated_at')
+          .eq('idempotency_key', idempotencyKey)
+          .maybeSingle();
+
+        if (existing) {
+          if (existing.status === 'PENDING' || existing.status === 'PROCESSING') {
+            const schedTime = new Date(existing.scheduled_at || 0).getTime();
+            const isStale = (nowMs - schedTime > 30 * 60 * 1000) && existing.status === 'PENDING';
+            if (isStale) {
+              await this.supabase
+                .from('whatsapp_queue')
+                .update({
+                  status: 'FAILED',
+                  failure_reason: 'Stale delivery window expired (superseded)',
+                  updated_at: new Date().toISOString(),
+                })
+                .eq('id', existing.id);
+              this.inMemoryQueue.delete(existing.id);
+            } else {
+              console.log(`[QueueService] Message with idempotency key ${idempotencyKey} is already ${existing.status} in DB. Halting duplicate.`);
+              throw new AppError('Message is already queued and waiting for dispatch', 409, 'DUPLICATE_MESSAGE');
+            }
+          } else if (existing.status === 'SENT') {
+            const sentTime = new Date(existing.sent_at || existing.updated_at || 0).getTime();
+            if (nowMs - sentTime < 10 * 60 * 1000) {
+              console.log(`[QueueService] Message with idempotency key ${idempotencyKey} was already sent to DB. Halting duplicate.`);
+              throw new AppError('Message has already been sent to this recipient recently', 409, 'DUPLICATE_MESSAGE');
+            }
+          }
+        }
+      } catch (err: any) {
+        if (err instanceof AppError) throw err;
+      }
+    }
+
+    const queueId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const scheduledAt = params.scheduledAt || now;
+
+    // Strict Recipient Security & Dummy Guard (Requirement 4)
+    const isDummy = this.isBlockedOrDummyNumber(normalizedPhone);
+    const crmCheck = isDummy
+      ? { allowed: false, reason: `Blocked delivery: ${normalizedPhone} is a dummy/placeholder test number.` }
+      : await recipientSecurityService.validateCrmRecipient(normalizedPhone);
+
+    const isSecurityBlocked = !crmCheck.allowed;
+    if (isSecurityBlocked) {
+      if (isDummy) {
+        console.warn(`[SAFETY GUARD] ${crmCheck.reason}`);
+      } else {
+        console.warn(`[SECURITY BLOCK] Attempted send to non-CRM number: ${normalizedPhone} (${crmCheck.reason})`);
+      }
+    }
+
+    const newItem: WhatsAppQueueItem = {
+      id: queueId,
+      recipient_phone: normalizedPhone,
+      student_id: params.studentId || null,
+      template_id: params.templateId || null,
+      event_type: eventType,
+      message_body: params.messageBody,
+      scheduled_at: scheduledAt,
+      status: isSecurityBlocked ? 'FAILED' : 'PENDING',
+      attempts: isSecurityBlocked ? 1 : 0,
+      max_attempts: isSecurityBlocked ? 0 : 3,
+      sent_at: null,
+      failure_reason: isSecurityBlocked ? (crmCheck.reason || `[SECURITY BLOCK] Attempted send to non-CRM number: ${normalizedPhone}`) : null,
+      idempotency_key: idempotencyKey,
+      provider_message_id: null,
+      metadata: params.metadata || {},
+      created_at: now,
+      updated_at: now,
+    };
+
+    // Store in-memory
+    this.inMemoryQueue.set(queueId, newItem);
+
+    // Persist to Supabase if table exists
+    if (this.supabase) {
+      try {
+        const { data, error } = await this.supabase
+          .from('whatsapp_queue')
+          .insert({
+            id: newItem.id,
+            recipient_phone: newItem.recipient_phone,
+            student_id: newItem.student_id,
+            event_type: newItem.event_type,
+            message_body: newItem.message_body,
+            scheduled_at: newItem.scheduled_at,
+            status: newItem.status,
+            attempts: newItem.attempts,
+            max_attempts: newItem.max_attempts,
+            idempotency_key: newItem.idempotency_key,
+          })
+          .select()
+          .single();
+
+        if (error) {
+          if (error.code === '23505' || error.message?.includes('duplicate key') || error.message?.includes('unique constraint')) {
+            const { data: existingRec } = await this.supabase
+              .from('whatsapp_queue')
+              .select('id, status, scheduled_at, sent_at, updated_at')
+              .eq('idempotency_key', newItem.idempotency_key)
+              .maybeSingle();
+
+            const isStaleRec = existingRec?.scheduled_at ? (Date.now() - new Date(existingRec.scheduled_at).getTime() > 30 * 60 * 1000) : false;
+
+            // Only re-enqueue if the previous record failed, was cancelled, or was stale pending
+            if (existingRec && (existingRec.status === 'FAILED' || existingRec.status === 'CANCELLED' || isStaleRec)) {
+              const { data: updated, error: updateErr } = await this.supabase
+                .from('whatsapp_queue')
+                .update({
+                  recipient_phone: newItem.recipient_phone,
+                  student_id: newItem.student_id,
+                  event_type: newItem.event_type,
+                  message_body: newItem.message_body,
+                  scheduled_at: newItem.scheduled_at,
+                  status: newItem.status,
+                  attempts: 0,
+                  failure_reason: null,
+                  sent_at: null,
+                  updated_at: new Date().toISOString(),
+                })
+                .eq('id', existingRec.id)
+                .select()
+                .single();
+
+              if (!updateErr && updated) {
+                this.inMemoryQueue.set(existingRec.id, { ...newItem, ...updated });
+                return updated as WhatsAppQueueItem;
+              }
+            }
+            throw new AppError('Message is already queued and waiting for dispatch', 409, 'DUPLICATE_MESSAGE');
+          }
+        }
+
+        if (!error && data) {
+          this.inMemoryQueue.set(queueId, { ...newItem, ...data });
+          // If scheduled for now, trigger worker immediately
+          if (!isSecurityBlocked && (!params.scheduledAt || new Date(params.scheduledAt).getTime() <= Date.now() + 2000)) {
+            this.triggerBackgroundProcessing();
+          }
+          return data as WhatsAppQueueItem;
+        }
+      } catch (err: any) {
+        if (err instanceof AppError) throw err;
+      }
+    }
+
+    // If scheduled for now, trigger worker immediately
+    if (!isSecurityBlocked && (!params.scheduledAt || new Date(params.scheduledAt).getTime() <= Date.now() + 2000)) {
+      this.triggerBackgroundProcessing();
+    }
+
+    return newItem;
+  }
+
+  // ============================================================================
+  // 2. PROCESS INDIVIDUAL QUEUE ITEM (WITH ALL 10 SAFETY CHECKS)
+  // ============================================================================
+  async processItem(item: WhatsAppQueueItem): Promise<{ success: boolean; reason?: string; status: WhatsAppQueueStatus; result?: any }> {
+    if (!item || !item.id) {
+      return { success: false, reason: 'Invalid queue item', status: 'FAILED' };
+    }
+
+    // --- CONCURRENCY GUARD 1: In-Flight Mutex on item.id ---
+    if (this.inFlightItemIds.has(item.id)) {
+      console.log(`[QueueService] 🔒 Item ${item.id} is already in-flight. Skipping duplicate processItem execution.`);
+      return { success: false, reason: 'Item already in-flight', status: 'PROCESSING' };
+    }
+
+    const normalizedPhone = this.normalizePhoneNumber(item.recipient_phone);
+
+    // --- CONCURRENCY GUARD 2: In-Flight Recipient check ---
+    if (this.processingRecipients.has(normalizedPhone) || this.processingRecipients.has(item.recipient_phone)) {
+      const reason = `Another message for recipient ${normalizedPhone} is currently processing`;
+      return { success: false, reason, status: 'PENDING' };
+    }
+
+    // --- CONCURRENCY GUARD 3: In-Memory status check ---
+    const inMem = this.inMemoryQueue.get(item.id);
+    if (inMem && inMem.status === 'SENT') {
+      return { success: true, reason: 'Message already sent', status: 'SENT' };
+    }
+    if (inMem && inMem.status === 'PROCESSING') {
+      return { success: false, reason: 'Item already processing in memory', status: 'PROCESSING' };
+    }
+
+    // --- CONCURRENCY GUARD 4: Atomic Check-and-Set in Database ---
+    if (this.supabase) {
+      try {
+        const { data: dbItem } = await this.supabase
+          .from('whatsapp_queue')
+          .select('status')
+          .eq('id', item.id)
+          .maybeSingle();
+
+        if (dbItem && dbItem.status === 'SENT') {
+          if (inMem) inMem.status = 'SENT';
+          return { success: true, reason: 'Message already sent in database', status: 'SENT' };
+        }
+        if (dbItem && dbItem.status === 'PROCESSING') {
+          return { success: false, reason: 'Message already marked PROCESSING in database', status: 'PROCESSING' };
+        }
+
+        // Atomically claim from PENDING to PROCESSING
+        const { data: claimed } = await this.supabase
+          .from('whatsapp_queue')
+          .update({ status: 'PROCESSING', updated_at: new Date().toISOString() })
+          .eq('id', item.id)
+          .eq('status', 'PENDING')
+          .select('id, status')
+          .maybeSingle();
+
+        if (!claimed && dbItem && dbItem.status !== 'PENDING') {
+          return { success: dbItem.status === 'SENT', reason: 'Already claimed by another worker', status: (dbItem.status as any) || 'PROCESSING' };
+        }
+      } catch (dbErr: any) {
+        console.warn('[QueueService] Notice during atomic queue claim:', dbErr.message);
+      }
+    }
+
+    // --- CONCURRENCY GUARD 5: Deduplication Cooldown Window (45s) ---
+    const dedupeKey = `${normalizedPhone}_${item.event_type || 'GENERAL'}_${item.student_id || ''}`;
+    const lastSentTime = this.recentDispatchedMap.get(dedupeKey);
+    if (lastSentTime && Date.now() - lastSentTime < 45000) {
+      console.log(`[QueueService] 🛡️ Duplicate suppressed for ${normalizedPhone} (${item.event_type}) - sent ${Math.round((Date.now() - lastSentTime) / 1000)}s ago.`);
+      await this.updateItemStatus(item.id, 'CANCELLED');
+      return { success: true, reason: 'Duplicate suppressed within 45s safety cooldown', status: 'CANCELLED' };
+    }
+
+    // Acquire In-Flight Locks
+    this.inFlightItemIds.add(item.id);
+    this.processingRecipients.add(normalizedPhone);
+    this.processingRecipients.add(item.recipient_phone);
+    if (inMem) inMem.status = 'PROCESSING';
+
+    try {
+      const settings = await whatsappSettingsService.getSettings();
+      const provider = whatsappProviderFactory.getProvider(settings.provider_type);
+
+      // --- SAFETY CHECK 1: Is Global Automation ON? ---
+      if (!settings.global_automation_enabled) {
+        const reason = 'Global WhatsApp automation is currently disabled (OFF)';
+        await this.markItemFailed(item.id, reason, false);
+        return { success: false, reason, status: 'PENDING' };
+      }
+
+      // --- SAFETY CHECK 2: Is Emergency STOP OFF? ---
+      if (settings.emergency_stop) {
+        const reason = 'Emergency STOP is active. All message dispatches are halted.';
+        await this.markItemFailed(item.id, reason, false);
+        return { success: false, reason, status: 'PENDING' };
+      }
+
+      // --- SAFETY CHECK 3: Is Recipient Opted-in? ---
+      const isOptedIn = await whatsappSettingsService.isOptedIn({
+        studentId: item.student_id || undefined,
+        phoneNumber: item.recipient_phone,
+      });
+      if (!isOptedIn) {
+        const reason = 'Recipient has opted out of WhatsApp messages (whatsapp_opt_in = false)';
+        await this.markItemFailed(item.id, reason, true);
+        return { success: false, reason, status: 'FAILED' };
+      }
+
+      // --- SAFETY CHECK 4: Is Recipient Phone Valid? ---
+      const cleanedPhone = item.recipient_phone.replace(/[^\d+]/g, '');
+      if (!cleanedPhone || cleanedPhone.length < 8) {
+        const reason = 'Invalid recipient phone number format';
+        await this.markItemFailed(item.id, reason, true);
+        return { success: false, reason, status: 'FAILED' };
+      }
+
+      // --- SAFETY CHECK 4b: Is this a dummy, placeholder, or demo test number? ---
+      if (provider.name !== 'MOCK' && this.isBlockedOrDummyNumber(item.recipient_phone)) {
+        const reason = `Blocked delivery: ${item.recipient_phone} is a dummy/placeholder test number. Live dispatch cancelled to protect real subscribers.`;
+        console.warn(`[QueueService] 🛑 ${reason}`);
+        await this.markItemFailed(item.id, reason, true);
+        await this.updateItemStatus(item.id, 'CANCELLED');
+        return { success: false, reason, status: 'CANCELLED' };
+      }
+
+      // --- SAFETY CHECK 4c (Requirement 4): Is recipient a verified CRM contact? ---
+      if (provider.name !== 'MOCK') {
+        const crmCheck = await recipientSecurityService.validateCrmRecipient(item.recipient_phone);
+        if (!crmCheck.allowed) {
+          const reason = `[SECURITY BLOCK] Attempted send to non-CRM number: ${item.recipient_phone}`;
+          console.warn(`[QueueService] 🛑 ${reason}`);
+          await this.markItemFailed(item.id, reason, true, true);
+          await this.updateItemStatus(item.id, 'FAILED');
+          return { success: false, reason, status: 'FAILED' };
+        }
+      }
+
+      // --- SAFETY CHECK 5: Is Message Still Valid? ---
+      if (item.status === 'CANCELLED') {
+        return { success: false, reason: 'Message was cancelled', status: 'CANCELLED' };
+      }
+      if (item.status === 'FAILED') {
+        return { success: false, reason: item.failure_reason || 'Message failed validation', status: 'FAILED' };
+      }
+      if (item.status === 'SENT') {
+        return { success: true, reason: 'Message already sent', status: 'SENT' };
+      }
+
+      // --- SAFETY CHECK 8: Has the Daily Sending Limit been reached? ---
+      const todayStats = await this.getTodayStats();
+      if (todayStats.sent >= settings.daily_limit) {
+        const reason = `Daily sending limit reached (${settings.daily_limit} messages). Message queued safely.`;
+        await this.markItemFailed(item.id, reason, false);
+        return { success: false, reason, status: 'PENDING' };
+      }
+
+      // --- SAFETY CHECK 9: Is the WhatsApp Sender Connected? ---
+      let deviceStatus = await provider.getStatus();
+
+      // Reconnecting Gate: If WhatsApp is momentarily CONNECTING or RECONNECTING (e.g. during 515/428 resets),
+      // wait up to 12s with polling so stream recovery does NOT drop or cancel pending messages!
+      if (deviceStatus.status === 'CONNECTING' || (deviceStatus as any).status === 'RECONNECTING') {
+        console.log(`[QueueService] ⏳ WhatsApp is ${deviceStatus.status}. Waiting for connection gate (up to 12s)...`);
+        const gateStart = Date.now();
+        while (Date.now() - gateStart < 12000) {
+          await new Promise((r) => setTimeout(r, 1500));
+          deviceStatus = await provider.getStatus();
+          if (deviceStatus.status === 'CONNECTED') {
+            console.log('[QueueService] ✅ Connection restored within gate. Resuming message dispatch.');
+            break;
+          }
+        }
+      }
+
+      if (deviceStatus.status !== 'CONNECTED') {
+        const reason = `WhatsApp sender is not connected (Status: ${deviceStatus.status})`;
+        // Keep item safely in PENDING state so background worker retries as soon as WhatsApp is reconnected
+        console.warn(`[QueueService] ⚠️ Sender not connected (${deviceStatus.status}). Message ${item.id} kept in PENDING state.`);
+        await this.markItemFailed(item.id, reason, false);
+        return { success: false, reason, status: 'PENDING' };
+      }
+
+      // --- SAFETY CHECK 10: Is the Provider Available & Healthy? ---
+      const health = await provider.healthCheck();
+      if (!health.healthy) {
+        const reason = `WhatsApp provider healthcheck failed: ${health.details || 'Unavailable'}`;
+        await this.markItemFailed(item.id, reason, false);
+        return { success: false, reason, status: 'PENDING' };
+      }
+
+      // Anti-Ban Rate Limiting: Humanized 3.5 - 6.0 seconds randomized gap between consecutive WhatsApp deliveries
+      if (
+        (provider.name === 'PROTOTYPE_LINKED_DEVICE' ||
+          provider.name === 'OPENWA' ||
+          provider.name === 'BAILEYS') &&
+        this.lastDispatchedAt > 0
+      ) {
+        const elapsed = Date.now() - this.lastDispatchedAt;
+        const dynamicDelay = this.MIN_DISPATCH_INTERVAL_MS + Math.floor(Math.random() * 2500); // 3.5s to 6.0s
+        if (elapsed < dynamicDelay) {
+          const waitMs = dynamicDelay - elapsed;
+          console.log(
+            `[QueueService] Anti-Ban throttle (${provider.name}): waiting ${(waitMs / 1000).toFixed(1)}s before dispatching to ${item.recipient_phone}...`
+          );
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+        }
+      }
+
+      const result = await provider.sendMessage({
+        to: item.recipient_phone,
+        body: item.message_body,
+      });
+
+      this.lastDispatchedAt = Date.now();
+      if (result.success) {
+        this.recentDispatchedMap.set(dedupeKey, Date.now());
+      }
+
+      // Check if recipient is not registered on WhatsApp
+      const isNotOnWhatsApp =
+        result?.errorMessage?.includes('not registered on WhatsApp') ||
+        result?.errorMessage?.includes('not on WhatsApp');
+
+      if (isNotOnWhatsApp) {
+        const reason = `Recipient ${item.recipient_phone} is not registered on WhatsApp. Halted further retries to protect account.`;
+        console.warn(`[QueueService] 🛑 ${reason}`);
+        await this.markItemFailed(item.id, reason, true, true);
+        await this.updateItemStatus(item.id, 'FAILED');
+        return { success: false, reason, status: 'FAILED', result };
+      }
+
+      if (result.success) {
+        const queueStatus: WhatsAppQueueStatus = 'SENT';
+        await this.markItemSent(item.id, result.messageId || `msg_${Date.now()}`, queueStatus);
+        return { success: true, status: queueStatus, result };
+      } else {
+        const isTransient =
+          result?.errorMessage?.includes('zombie socket') ||
+          result?.errorMessage?.includes('timed out') ||
+          result?.errorMessage?.includes('Connection Closed') ||
+          result?.errorMessage?.includes('Stream reset');
+        const isPermanent = !isTransient;
+        await this.markItemFailed(item.id, result.errorMessage || 'Provider delivery error', true, isPermanent);
+        const finalItem = this.inMemoryQueue.get(item.id);
+        const finalStatus = finalItem?.status || 'FAILED';
+        return { success: false, reason: result.errorMessage, status: finalStatus, result };
+      }
+    } catch (err: any) {
+      const isNotOnWhatsApp = err.message?.includes('not registered on WhatsApp');
+      if (isNotOnWhatsApp) {
+        const reason = `Recipient ${item.recipient_phone} is not registered on WhatsApp. Halted further retries to protect account.`;
+        console.warn(`[QueueService] 🛑 ${reason}`);
+        await this.markItemFailed(item.id, reason, true, true);
+        await this.updateItemStatus(item.id, 'FAILED');
+        return { success: false, reason, status: 'FAILED' };
+      }
+      const isTransient =
+        err.message?.includes('zombie socket') ||
+        err.message?.includes('timed out') ||
+        err.message?.includes('Connection Closed') ||
+        err.message?.includes('Stream reset');
+      const isPermanent = !isTransient;
+      await this.markItemFailed(item.id, err.message || 'Unexpected sending exception', true, isPermanent);
+      const finalItem = this.inMemoryQueue.get(item.id);
+      const finalStatus = finalItem?.status || 'FAILED';
+      return { success: false, reason: err.message, status: finalStatus };
+    } finally {
+      this.inFlightItemIds.delete(item.id);
+      this.processingRecipients.delete(normalizedPhone);
+      this.processingRecipients.delete(item.recipient_phone);
+    }
+  }
+
+  // ============================================================================
+  // 2.5 FETCH DUE QUEUE ITEMS (From Supabase & In-Memory with Stale Recovery)
+  // ============================================================================
+  async fetchDueQueueItems(batchSize = 25, forceNow: boolean = false): Promise<WhatsAppQueueItem[]> {
+    const now = new Date().toISOString();
+
+    if (this.supabase) {
+      try {
+        // 0. Auto-expire old pending items older than 48 hours so they never clog the dispatch pipeline
+        const twoDaysAgo = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+        await this.supabase
+          .from('whatsapp_queue')
+          .update({ status: 'FAILED', failure_reason: 'Stale delivery window expired', updated_at: now })
+          .eq('status', 'PENDING')
+          .lt('scheduled_at', twoDaysAgo);
+
+        // 1. Cancel stale PROCESSING items older than 3 minutes (NEVER revert to PENDING to prevent blasts)
+        const threeMinutesAgo = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+        await this.supabase
+          .from('whatsapp_queue')
+          .update({ status: 'CANCELLED', failure_reason: 'Stale processing timeout expired', updated_at: now })
+          .eq('status', 'PROCESSING')
+          .lt('updated_at', threeMinutesAgo);
+
+        // 2. Query due items (scheduled within last 48 hours up to now)
+        let query = this.supabase
+          .from('whatsapp_queue')
+          .select('*')
+          .eq('status', 'PENDING')
+          .gte('scheduled_at', twoDaysAgo);
+
+        if (!forceNow) {
+          query = query.lte('scheduled_at', now);
+        }
+
+        const { data, error } = await query
+          .order('scheduled_at', { ascending: true })
+          .limit(batchSize);
+
+        if (!error && Array.isArray(data) && data.length > 0) {
+          for (const row of data) {
+            this.inMemoryQueue.set(row.id, row as WhatsAppQueueItem);
+          }
+          return data as WhatsAppQueueItem[];
+        }
+      } catch (err: any) {
+        console.warn('[QueueService] DB queue fetch notice:', err.message);
+      }
+    }
+
+    // Fallback to in-memory queue
+    const twoDaysAgoTime = Date.now() - 48 * 60 * 60 * 1000;
+    return Array.from(this.inMemoryQueue.values())
+      .filter((i) => i.status === 'PENDING' && new Date(i.scheduled_at).getTime() >= twoDaysAgoTime && (forceNow || i.scheduled_at <= now))
+      .slice(0, batchSize);
+  }
+
+  /**
+   * Cancel all pending queue items associated with an announcement
+   */
+  async cancelPendingItemsForAnnouncement(announcementId: string, title?: string): Promise<number> {
+    let cancelledCount = 0;
+    const now = new Date().toISOString();
+
+    // 1. In-Memory cancellation
+    for (const item of this.inMemoryQueue.values()) {
+      if (item.status === 'PENDING') {
+        const matchesId = item.idempotency_key?.includes(announcementId) || (item.metadata as any)?.announcementId === announcementId;
+        const matchesTitle = title && (item.message_body?.startsWith(`📢 *${title}*`) || item.message_body?.includes(`📢 *${title}*\n`));
+        if (matchesId || matchesTitle) {
+          item.status = 'CANCELLED';
+          item.updated_at = now;
+          cancelledCount++;
+        }
+      }
+    }
+
+    // 2. Supabase cancellation
+    if (this.supabase) {
+      try {
+        if (announcementId) {
+          const { data } = await this.supabase
+            .from('whatsapp_queue')
+            .update({ status: 'CANCELLED', updated_at: now })
+            .eq('status', 'PENDING')
+            .eq('event_type', 'ANNOUNCEMENT')
+            .ilike('idempotency_key', `%${announcementId}%`)
+            .select('id');
+          if (data) cancelledCount = Math.max(cancelledCount, data.length);
+        }
+
+        if (title && cancelledCount === 0) {
+          const { data } = await this.supabase
+            .from('whatsapp_queue')
+            .update({ status: 'CANCELLED', updated_at: now })
+            .eq('status', 'PENDING')
+            .eq('event_type', 'ANNOUNCEMENT')
+            .ilike('message_body', `📢 *${title}*%`)
+            .select('id');
+          if (data) cancelledCount = Math.max(cancelledCount, data.length);
+        }
+      } catch (err: any) {
+        console.warn('[QueueService] Error cancelling announcement queue items:', err.message);
+      }
+    }
+
+    return cancelledCount;
+  }
+
+  /**
+   * Cancel pending queue items strictly for an individual delivery slot
+   */
+  async cancelPendingItemsForSlot(slotId: string): Promise<number> {
+    let cancelledCount = 0;
+    const now = new Date().toISOString();
+
+    // 1. In-Memory cancellation
+    for (const item of this.inMemoryQueue.values()) {
+      if (item.status === 'PENDING') {
+        const matchesSlot =
+          item.idempotency_key?.includes(slotId) ||
+          (item.metadata as any)?.slotId === slotId;
+        if (matchesSlot) {
+          item.status = 'CANCELLED';
+          item.updated_at = now;
+          cancelledCount++;
+        }
+      }
+    }
+
+    // 2. Supabase cancellation
+    if (this.supabase && slotId) {
+      try {
+        const { data } = await this.supabase
+          .from('whatsapp_queue')
+          .update({ status: 'CANCELLED', updated_at: now })
+          .eq('status', 'PENDING')
+          .ilike('idempotency_key', `%${slotId}%`)
+          .select('id');
+        if (data) cancelledCount = Math.max(cancelledCount, data.length);
+      } catch (err: any) {
+        console.warn(`[QueueService] Error cancelling slot ${slotId} items:`, err.message);
+      }
+    }
+
+    return cancelledCount;
+  }
+
+  /**
+   * Update scheduled time or message for an individual delivery slot
+   */
+  async updateSlotQueueItems(
+    slotId: string,
+    newScheduledAt: string,
+    newFormattedBody?: string
+  ): Promise<number> {
+    let updatedCount = 0;
+    const now = new Date().toISOString();
+
+    // 1. In-Memory update
+    for (const item of this.inMemoryQueue.values()) {
+      if (item.status === 'PENDING') {
+        const matchesSlot =
+          item.idempotency_key?.includes(slotId) ||
+          (item.metadata as any)?.slotId === slotId;
+        if (matchesSlot) {
+          item.scheduled_at = newScheduledAt;
+          if (newFormattedBody) item.message_body = newFormattedBody;
+          item.updated_at = now;
+          updatedCount++;
+        }
+      }
+    }
+
+    // 2. Supabase update
+    if (this.supabase && slotId) {
+      try {
+        const updatePayload: Record<string, any> = {
+          scheduled_at: newScheduledAt,
+          updated_at: now,
+        };
+        if (newFormattedBody) {
+          updatePayload.message_body = newFormattedBody;
+        }
+
+        const { data } = await this.supabase
+          .from('whatsapp_queue')
+          .update(updatePayload)
+          .eq('status', 'PENDING')
+          .ilike('idempotency_key', `%${slotId}%`)
+          .select('id');
+
+        if (data) updatedCount = Math.max(updatedCount, data.length);
+      } catch (err: any) {
+        console.warn(`[QueueService] Error updating slot ${slotId} queue items:`, err.message);
+      }
+    }
+
+    return updatedCount;
+  }
+
+  /**
+   * Immediately dispatch pending items for an individual delivery slot
+   */
+  async dispatchSlotNow(slotId: string): Promise<{ dispatched: number }> {
+    const now = new Date().toISOString();
+    const affectedIds: string[] = [];
+
+    // 1. Supabase update to now
+    if (this.supabase && slotId) {
+      try {
+        const { data } = await this.supabase
+          .from('whatsapp_queue')
+          .update({ scheduled_at: now, updated_at: now })
+          .eq('status', 'PENDING')
+          .ilike('idempotency_key', `%${slotId}%`)
+          .select('*');
+
+        if (data && data.length > 0) {
+          for (const item of data) {
+            this.inMemoryQueue.set(item.id, item as WhatsAppQueueItem);
+            affectedIds.push(item.id);
+          }
+        }
+      } catch (err: any) {
+        console.warn(`[QueueService] Error triggering immediate slot dispatch for ${slotId}:`, err.message);
+      }
+    }
+
+    // 2. In-memory update
+    for (const item of this.inMemoryQueue.values()) {
+      if (item.status === 'PENDING') {
+        const matchesSlot =
+          item.idempotency_key?.includes(slotId) ||
+          (item.metadata as any)?.slotId === slotId;
+        if (matchesSlot) {
+          item.scheduled_at = now;
+          if (!affectedIds.includes(item.id)) affectedIds.push(item.id);
+        }
+      }
+    }
+
+    // Trigger queue runner in background
+    this.triggerBackgroundProcessing();
+
+    return { dispatched: affectedIds.length };
+  }
+
+  /**
+   * Permanently delete all pending, processing, and queued messages from the WhatsApp queue and database.
+   * Hard-deletes from whatsapp_queue and whatsapp_messages.
+   */
+  async purgeQueue(): Promise<{ cancelledCount: number; deletedCount: number }> {
+    let deletedCount = 0;
+
+    // 1. Purge In-Memory queue items
+    deletedCount += this.inMemoryQueue.size;
+    this.inMemoryQueue.clear();
+    this.processingRecipients.clear();
+
+    // 2. Supabase permanent hard deletion of all PENDING, PROCESSING, CANCELLED, or QUEUED items
+    if (this.supabase) {
+      try {
+        const { data: queueData } = await this.supabase
+          .from('whatsapp_queue')
+          .delete()
+          .in('status', ['PENDING', 'PROCESSING', 'CANCELLED', 'QUEUED'])
+          .select('id');
+
+        if (queueData) {
+          deletedCount = Math.max(deletedCount, queueData.length);
+        }
+
+        // Delete all queued messages from whatsapp_messages table
+        const { data: msgData } = await this.supabase
+          .from('whatsapp_messages')
+          .delete()
+          .eq('status', 'QUEUED')
+          .select('id');
+
+        if (msgData) {
+          deletedCount += msgData.length;
+        }
+      } catch (err: any) {
+        console.warn('[QueueService] Error permanently deleting queue items:', err.message);
+      }
+    }
+
+    console.log(`[QueueService] 🗑️ Permanently deleted ${deletedCount} queued messages.`);
+    return { cancelledCount: deletedCount, deletedCount };
+  }
+
+  /**
+   * Delete a single message from whatsapp_queue or whatsapp_messages
+   */
+  async deleteQueueItem(id: string): Promise<boolean> {
+    this.inMemoryQueue.delete(id);
+    if (this.supabase) {
+      try {
+        await Promise.all([
+          this.supabase.from('whatsapp_queue').delete().eq('id', id),
+          this.supabase.from('whatsapp_messages').delete().eq('id', id),
+        ]);
+      } catch (err: any) {
+        console.warn('[QueueService] Error deleting queue/message item:', err.message);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Update scheduled time and/or message body for pending queue items of an announcement
+   */
+  async updateScheduledAnnouncementItems(
+    announcementId: string,
+    newScheduledTime: string,
+    newFormattedMessage?: string,
+    title?: string
+  ): Promise<number> {
+    let updatedCount = 0;
+    const now = new Date().toISOString();
+
+    for (const item of this.inMemoryQueue.values()) {
+      if (item.status === 'PENDING') {
+        const matchesId = item.idempotency_key?.includes(announcementId) || (item.metadata as any)?.announcementId === announcementId;
+        const matchesTitle = title && (item.message_body?.startsWith(`📢 *${title}*`) || item.message_body?.includes(`📢 *${title}*\n`));
+        if (matchesId || matchesTitle) {
+          item.scheduled_at = newScheduledTime;
+          if (newFormattedMessage) item.message_body = newFormattedMessage;
+          item.updated_at = now;
+          updatedCount++;
+        }
+      }
+    }
+
+    if (this.supabase) {
+      try {
+        const updatePayload: any = {
+          scheduled_at: newScheduledTime,
+          updated_at: now,
+        };
+        if (newFormattedMessage) {
+          updatePayload.message_body = newFormattedMessage;
+        }
+
+        let { data } = await this.supabase
+          .from('whatsapp_queue')
+          .update(updatePayload)
+          .eq('status', 'PENDING')
+          .eq('event_type', 'ANNOUNCEMENT')
+          .ilike('idempotency_key', `%${announcementId}%`)
+          .select('id');
+
+        if ((!data || data.length === 0) && title) {
+          const res = await this.supabase
+            .from('whatsapp_queue')
+            .update(updatePayload)
+            .eq('status', 'PENDING')
+            .eq('event_type', 'ANNOUNCEMENT')
+            .ilike('message_body', `📢 *${title}*%`)
+            .select('id');
+          data = res.data;
+        }
+
+        if (data) updatedCount = Math.max(updatedCount, data.length);
+      } catch (err: any) {
+        console.warn('[QueueService] Error updating announcement queue items:', err.message);
+      }
+    }
+
+    return updatedCount;
+  }
+
+  /**
+   * Dispatch scheduled announcement items immediately
+   */
+  async dispatchAnnouncementNow(announcementId: string, title?: string): Promise<{ dispatched: number; immediateSuccess: number }> {
+    const now = new Date().toISOString();
+    const affectedIds: string[] = [];
+
+    // Find and update items to now
+    if (this.supabase) {
+      try {
+        let { data } = await this.supabase
+          .from('whatsapp_queue')
+          .update({ scheduled_at: now, updated_at: now })
+          .eq('status', 'PENDING')
+          .eq('event_type', 'ANNOUNCEMENT')
+          .ilike('idempotency_key', `%${announcementId}%`)
+          .select('*');
+
+        if ((!data || data.length === 0) && title) {
+          const res = await this.supabase
+            .from('whatsapp_queue')
+            .update({ scheduled_at: now, updated_at: now })
+            .eq('status', 'PENDING')
+            .eq('event_type', 'ANNOUNCEMENT')
+            .ilike('message_body', `📢 *${title}*%`)
+            .select('*');
+          data = res.data;
+        }
+
+        if (data && data.length > 0) {
+          for (const item of data) {
+            this.inMemoryQueue.set(item.id, item as WhatsAppQueueItem);
+            affectedIds.push(item.id);
+          }
+        }
+      } catch (err: any) {
+        console.warn('[QueueService] Error triggering immediate dispatch:', err.message);
+      }
+    }
+
+    // Also update in-memory
+    for (const item of this.inMemoryQueue.values()) {
+      if (item.status === 'PENDING') {
+        const matchesId = item.idempotency_key?.includes(announcementId) || (item.metadata as any)?.announcementId === announcementId;
+        const matchesTitle = title && (item.message_body?.startsWith(`📢 *${title}*`) || item.message_body?.includes(`📢 *${title}*\n`));
+        if (matchesId || matchesTitle) {
+          item.scheduled_at = now;
+          if (!affectedIds.includes(item.id)) affectedIds.push(item.id);
+        }
+      }
+    }
+
+    // Trigger queue runner in background
+    this.triggerBackgroundProcessing();
+
+    return {
+      dispatched: affectedIds.length,
+      immediateSuccess: affectedIds.length,
+    };
+  }
+
+  // ============================================================================
+  // 3. PROCESS QUEUE BATCH
+  // ============================================================================
+  async processQueue(batchSize = 50, forceNow: boolean = false): Promise<{
+    processed: number;
+    successful: number;
+    failed: number;
+    pending: number;
+  }> {
+    const settings = await whatsappSettingsService.getSettings();
+    if (!settings.global_automation_enabled || settings.emergency_stop) {
+      return { processed: 0, successful: 0, failed: 0, pending: this.getPendingCount() };
+    }
+
+    const provider = whatsappProviderFactory.getProvider(settings.provider_type);
+    let deviceStatus = await provider.getStatus();
+
+    // Reconnecting Gate: If temporarily connecting/reconnecting, wait up to 8s before bailing
+    if (deviceStatus.status === 'CONNECTING' || (deviceStatus as any).status === 'RECONNECTING') {
+      const gateStart = Date.now();
+      while (Date.now() - gateStart < 8000) {
+        await new Promise((r) => setTimeout(r, 1000));
+        deviceStatus = await provider.getStatus();
+        if (deviceStatus.status === 'CONNECTED') break;
+      }
+    }
+
+    if (deviceStatus.status !== 'CONNECTED') {
+      return { processed: 0, successful: 0, failed: 0, pending: this.getPendingCount() };
+    }
+
+    const pendingItems = await this.fetchDueQueueItems(batchSize, forceNow);
+
+    let successful = 0;
+    let failed = 0;
+
+    for (const item of pendingItems) {
+      const res = await this.processItem(item);
+      if (res.success) successful++;
+      else if (res.status === 'FAILED') failed++;
+      if (!res.success && res.reason?.includes('not connected')) {
+        break;
+      }
+    }
+
+    return {
+      processed: pendingItems.length,
+      successful,
+      failed,
+      pending: this.getPendingCount(),
+    };
+  }
+
+  private isProcessingBackground = false;
+  private schedulerInterval: NodeJS.Timeout | null = null;
+  private watchdogInterval: NodeJS.Timeout | null = null;
+  private lastWatchdogReconnectAttempt: number = 0;
+  private lastMonthlyFeeSync: number = 0;
+
+  /**
+   * Continuous WhatsApp Queue & Schedule Runner.
+   * Auto-flush on connect is strictly DISARMED to protect against queue blasting.
+   * Only processes explicitly scheduled future announcements whose delivery time has arrived.
+   */
+  startQueueScheduler(intervalMs = 30000): void {
+    if (this.schedulerInterval) return;
+    console.log(`[QueueService] 🛡️ Scheduled Announcements Runner active (auto-flush disarmed, checking every ${intervalMs / 1000}s)`);
+
+    this.schedulerInterval = setInterval(() => {
+      this.processScheduledAnnouncementsOnly().catch((err) => {
+        console.warn('[QueueService] Scheduled runner notice:', err.message);
+      });
+
+      this.triggerBackgroundProcessing();
+
+      // Periodically sync monthly fees & back-fill missing arrears every 6 hours
+      const nowMs = Date.now();
+      if (nowMs - this.lastMonthlyFeeSync > 6 * 60 * 60 * 1000) {
+        this.lastMonthlyFeeSync = nowMs;
+        feeService.syncMonthlyFeesForAllStudents().catch((err) => {
+          console.warn('[QueueService] Auto-sync fee notice:', err.message);
+        });
+      }
+    }, intervalMs);
+
+    if (this.schedulerInterval.unref) {
+      this.schedulerInterval.unref();
+    }
+
+    // Start 60-second WhatsApp 24/7 Keep-Alive & Auto-Reconnect Watchdog
+    this.startWatchdog(60000);
+  }
+
+  /**
+   * Safe scheduled announcement checker: ONLY processes items that were explicitly scheduled for a future time
+   * that has now arrived. NEVER touches general offline queues or blasts unannounced messages.
+   */
+  async processScheduledAnnouncementsOnly(): Promise<void> {
+    try {
+      const settings = await whatsappSettingsService.getSettings();
+      if (!settings.global_automation_enabled || settings.emergency_stop) return;
+
+      const provider = whatsappProviderFactory.getProvider(settings.provider_type);
+      let deviceStatus = await provider.getStatus();
+
+      // Reconnecting Gate: Wait up to 8s if socket is temporarily reconnecting
+      if (deviceStatus.status === 'CONNECTING' || (deviceStatus as any).status === 'RECONNECTING') {
+        const gateStart = Date.now();
+        while (Date.now() - gateStart < 8000) {
+          await new Promise((r) => setTimeout(r, 1000));
+          deviceStatus = await provider.getStatus();
+          if (deviceStatus.status === 'CONNECTED') break;
+        }
+      }
+
+      if (deviceStatus.status !== 'CONNECTED') return;
+
+      const now = new Date().toISOString();
+      if (this.supabase) {
+        // 1. Process items in whatsapp_queue whose scheduled_at has arrived
+        const { data: scheduledItems } = await this.supabase
+          .from('whatsapp_queue')
+          .select('*')
+          .eq('status', 'PENDING')
+          .eq('event_type', 'ANNOUNCEMENT')
+          .lte('scheduled_at', now)
+          .limit(10);
+
+        if (scheduledItems && scheduledItems.length > 0) {
+          for (const item of scheduledItems) {
+            // Verify scheduled_at is set and past due
+            if (item.scheduled_at && new Date(item.scheduled_at).getTime() <= Date.now()) {
+              await this.processItem(item as WhatsAppQueueItem);
+            }
+          }
+        }
+
+        // 2. Also check if any scheduled announcements in announcements table have reached their delivery time
+        try {
+          const { announcementService } = await import('../announcement.service.js');
+          const missed = await announcementService.getMissedScheduledAnnouncements();
+          if (missed && missed.length > 0) {
+            console.log(`[QueueService] ⏰ Auto-dispatching ${missed.length} scheduled announcement(s) whose delivery time has arrived.`);
+            await announcementService.dispatchMissedScheduledAnnouncements(missed.map((m: any) => m.id));
+          }
+        } catch (schErr: any) {
+          console.warn('[QueueService] Error checking scheduled announcements in DB:', schErr.message);
+        }
+      }
+    } catch (err: any) {
+      console.warn('[QueueService] Scheduled announcement check notice:', err.message);
+    }
+  }
+
+  startWatchdog(intervalMs = 60000): void {
+    if (this.watchdogInterval) return;
+    console.log(`[WhatsApp Watchdog] 🛡️ 24/7 Keep-Alive & Auto-Reconnect Watchdog active (pinging every ${intervalMs / 1000}s)`);
+
+    const runWatchdogPing = async () => {
+      try {
+        const settings = await whatsappSettingsService.getSettings();
+        if (settings.emergency_stop) return;
+
+        const provider = whatsappProviderFactory.getProvider(settings.provider_type);
+        if (!provider || typeof provider.getStatus !== 'function') return;
+
+        const status = await provider.getStatus();
+        const rawDigits = (status.phoneNumber || '').replace(/\D/g, '');
+        const isMock = rawDigits.includes('9999999999');
+
+        // 24/7 Render Free-Tier Keep-Alive Ping: Keeps configured Render services warm (isolated per client)
+        try {
+          const selfBackendUrl = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+          const selfBridgeUrl = (process.env.OPENWA_API_URL || process.env.WHATSAPP_LINKED_DEVICE_URL || '').replace(/\/+$/, '');
+          if (selfBackendUrl) {
+            fetch(`${selfBackendUrl}/api/health`, {
+              signal: AbortSignal.timeout(5000),
+            }).catch(() => {});
+          }
+          if (selfBridgeUrl) {
+            fetch(`${selfBridgeUrl}/health`, {
+              signal: AbortSignal.timeout(5000),
+            }).catch(() => {});
+          }
+        } catch {}
+
+        if (status.status === 'CONNECTED' && !isMock) {
+          // Keep bridge warm and update heartbeat in database
+          await whatsappSettingsService.updateDeviceStatus('CONNECTED', status.phoneNumber, {
+            lastHeartbeatAt: new Date().toISOString(),
+          }).catch(() => {});
+
+          // Automatically dispatch pending backlog queue items and scheduled announcements
+          this.triggerBackgroundProcessing();
+          this.processScheduledAnnouncementsOnly().catch(() => {});
+          return;
+        }
+
+        // If genuinely disconnected or session dropped/errored, attempt auto-reconnect with 30s backoff
+        // (Do NOT interrupt QR_READY or CONNECTING handshakes)
+        const currentSettings = await whatsappSettingsService.getSettings();
+        const isExplicitDisconnect = Boolean(currentSettings?.session_metadata?.explicit_disconnect);
+
+        // If explicitly unlinked by user/admin, do NOT automatically reconnect!
+        // Allow the user to pair a new account or scan fresh QR cleanly.
+        if (isExplicitDisconnect) {
+          return;
+        }
+
+        const now = Date.now();
+        if ((status.status === 'DISCONNECTED' || status.status === 'ERROR') && now - this.lastWatchdogReconnectAttempt > 30000) {
+          this.lastWatchdogReconnectAttempt = now;
+          console.log(`[WhatsApp Watchdog] ⚠️ Connection status is '${status.status}'. Attempting automatic socket reconnect...`);
+          if (typeof provider.connect === 'function') {
+            const reconnectRes = await provider.connect();
+            if (reconnectRes.status?.status === 'CONNECTED') {
+              console.log('[WhatsApp Watchdog] ✅ Auto-reconnected WhatsApp session successfully!');
+              this.triggerBackgroundProcessing();
+              this.processScheduledAnnouncementsOnly().catch(() => {});
+            } else if (reconnectRes.qrCode) {
+              console.log('[WhatsApp Watchdog] 📱 WhatsApp requires QR code re-authentication. Syncing QR_READY status...');
+              await whatsappSettingsService.updateDeviceStatus('QR_READY', undefined, {
+                sessionStatus: 'QR code ready for companion device scan',
+              }).catch(() => {});
+            }
+          }
+        }
+      } catch (err: any) {
+        console.warn('[WhatsApp Watchdog] Ping notice:', err.message);
+      }
+    };
+
+    setTimeout(runWatchdogPing, 5000);
+
+    this.watchdogInterval = setInterval(runWatchdogPing, intervalMs);
+    if (this.watchdogInterval.unref) {
+      this.watchdogInterval.unref();
+    }
+  }
+
+  stopQueueScheduler(): void {
+    if (this.schedulerInterval) {
+      clearInterval(this.schedulerInterval);
+      this.schedulerInterval = null;
+    }
+    if (this.watchdogInterval) {
+      clearInterval(this.watchdogInterval);
+      this.watchdogInterval = null;
+    }
+  }
+
+  triggerBackgroundProcessing(): void {
+    if (this.isProcessingBackground) return;
+    this.isProcessingBackground = true;
+
+    (async () => {
+      try {
+        const settings = await whatsappSettingsService.getSettings();
+        if (!settings.global_automation_enabled || settings.emergency_stop) {
+          return;
+        }
+
+        const provider = whatsappProviderFactory.getProvider(settings.provider_type);
+        const deviceStatus = await provider.getStatus();
+        if (deviceStatus.status !== 'CONNECTED') {
+          return;
+        }
+
+        while (true) {
+          const currentSettings = await whatsappSettingsService.getSettings();
+          if (!currentSettings.global_automation_enabled || currentSettings.emergency_stop) break;
+
+          const dueItems = await this.fetchDueQueueItems(10, false);
+          if (dueItems.length === 0) break;
+
+          for (const item of dueItems) {
+            const res = await this.processItem(item);
+            if (!res.success && (res.status === 'PENDING' || res.reason?.includes('not connected') || res.reason?.includes('limit') || res.reason?.includes('healthcheck'))) {
+              console.log(`[QueueService] Background worker paused (${res.reason || 'Pending'}). Will resume next tick.`);
+              return;
+            }
+          }
+        }
+      } catch (err: any) {
+        console.error('[QueueService] Background worker error:', err.message);
+      } finally {
+        this.isProcessingBackground = false;
+      }
+    })();
+  }
+
+  // ============================================================================
+  // 4. RETRY FAILED MESSAGE
+  // ============================================================================
+  async retryMessage(id: string): Promise<WhatsAppQueueItem> {
+    const item = this.inMemoryQueue.get(id);
+    if (!item) {
+      throw new AppError('Queue message not found', 404, 'RESOURCE_NOT_FOUND');
+    }
+
+    // Reset status to PENDING and trigger processing (re-running all 10 checks)
+    item.status = 'PENDING';
+    item.failure_reason = null;
+    item.updated_at = new Date().toISOString();
+
+    await this.processItem(item);
+    return this.inMemoryQueue.get(id) || item;
+  }
+
+  // ============================================================================
+  // 5. STATUS UPDATES & AUDIT LOGGING
+  // ============================================================================
+  private async updateItemStatus(id: string, status: WhatsAppQueueStatus) {
+    const item = this.inMemoryQueue.get(id);
+    if (item) {
+      item.status = status;
+      item.updated_at = new Date().toISOString();
+    }
+
+    if (this.supabase) {
+      try {
+        await this.supabase.from('whatsapp_queue').update({ status, updated_at: new Date().toISOString() }).eq('id', id);
+      } catch {
+        // Table not present
+      }
+    }
+  }
+
+  private async markItemSent(id: string, providerMessageId: string, finalStatus: WhatsAppQueueStatus = 'SENT') {
+    const now = new Date().toISOString();
+    const item = this.inMemoryQueue.get(id);
+    if (item) {
+      item.status = finalStatus;
+      item.sent_at = now;
+      item.provider_message_id = providerMessageId;
+      item.attempts += 1;
+      item.updated_at = now;
+    }
+
+    // Update in Supabase queue table if present
+    if (this.supabase) {
+      try {
+        const { error: updateErr } = await this.supabase
+          .from('whatsapp_queue')
+          .update({
+            status: finalStatus,
+            sent_at: now,
+            attempts: item ? item.attempts : 1,
+            updated_at: now,
+          })
+          .eq('id', id);
+        if (updateErr) {
+          console.warn('[QueueService] Error updating sent item in Supabase:', updateErr.message);
+        }
+      } catch (err: any) {
+        console.warn('[QueueService] Error updating sent item in Supabase:', err.message);
+      }
+
+      // Record in whatsapp_messages audit outbox log
+      if (item) {
+        try {
+          const isMock = providerMessageId.startsWith('mock_') || (item.metadata as any)?.provider === 'mock';
+          const { error: insertErr } = await this.supabase.from('whatsapp_messages').insert({
+            student_id: item.student_id,
+            recipient_phone: item.recipient_phone,
+            event_type: item.event_type,
+            message_body: item.message_body,
+            status: isMock ? 'MOCK' : 'SENT',
+            sent_at: now,
+          });
+          if (insertErr) {
+            console.warn('[QueueService] Notice: could not insert into whatsapp_messages:', insertErr.message);
+          }
+        } catch (e: any) {
+          console.warn('[QueueService] Notice: could not insert into whatsapp_messages:', e.message);
+        }
+      }
+    }
+  }
+
+  private async markItemFailed(id: string, reason: string, countAsAttempt: boolean, isPermanent = false) {
+    const now = new Date().toISOString();
+    const item = this.inMemoryQueue.get(id);
+    if (item) {
+      if (countAsAttempt) {
+        item.attempts += 1;
+      }
+      if (isPermanent || item.attempts >= item.max_attempts) {
+        item.status = 'FAILED';
+      } else {
+        item.status = 'PENDING';
+        // Backoff next attempt by 15s to allow socket recovery / throttle
+        item.scheduled_at = new Date(Date.now() + 15000).toISOString();
+      }
+      item.failure_reason = reason;
+      (item as any).error_message = reason;
+      item.updated_at = now;
+    }
+
+    if (this.supabase) {
+      try {
+        const updatePayload: Record<string, any> = {
+          failure_reason: reason,
+          updated_at: now,
+        };
+        if (item) {
+          updatePayload.status = item.status;
+          updatePayload.attempts = item.attempts;
+          updatePayload.scheduled_at = item.scheduled_at;
+        } else if (countAsAttempt) {
+          updatePayload.status = isPermanent ? 'FAILED' : 'PENDING';
+        }
+        await this.supabase.from('whatsapp_queue').update(updatePayload).eq('id', id);
+      } catch (err: any) {
+        console.warn('[QueueService] Error updating failed item in Supabase:', err.message);
+      }
+
+      // Record in whatsapp_messages log only on permanent failure
+      if (item && item.status === 'FAILED') {
+        try {
+          const { error: failInsertErr } = await this.supabase.from('whatsapp_messages').insert({
+            student_id: item.student_id,
+            recipient_phone: item.recipient_phone,
+            event_type: item.event_type,
+            message_body: item.message_body,
+            status: 'FAILED',
+            sent_at: now,
+          });
+          if (failInsertErr) {
+            console.warn('[QueueService] Notice: could not log failure to whatsapp_messages:', failInsertErr.message);
+          }
+        } catch {
+          // Ignored
+        }
+      }
+    }
+  }
+
+  // ============================================================================
+  // 6. QUERY & STATS
+  // ============================================================================
+  async listQueue(filters: QueueFilterQuery = {}): Promise<WhatsAppQueueItem[]> {
+    if (this.supabase) {
+      try {
+        let query = this.supabase
+          .from('whatsapp_queue')
+          .select('*')
+          .order('created_at', { ascending: false });
+
+        if (filters.status) {
+          query = query.eq('status', filters.status);
+        }
+        if (filters.recipientPhone) {
+          query = query.ilike('recipient_phone', `%${filters.recipientPhone}%`);
+        }
+        if (filters.studentId) {
+          query = query.eq('student_id', filters.studentId);
+        }
+        if (filters.eventType) {
+          query = query.eq('event_type', filters.eventType);
+        }
+        if (filters.limit) {
+          query = query.limit(filters.limit);
+        } else {
+          query = query.limit(100);
+        }
+
+        const { data, error } = await query;
+        if (!error && Array.isArray(data)) {
+          for (const item of data) {
+            this.inMemoryQueue.set(item.id, item as WhatsAppQueueItem);
+          }
+          return data as WhatsAppQueueItem[];
+        }
+      } catch (err: any) {
+        console.warn('[QueueService] DB listQueue notice:', err.message);
+      }
+    }
+
+    let items = Array.from(this.inMemoryQueue.values());
+
+    if (filters.status) {
+      items = items.filter((i) => i.status === filters.status);
+    }
+    if (filters.recipientPhone) {
+      items = items.filter((i) => i.recipient_phone.includes(filters.recipientPhone!));
+    }
+    if (filters.studentId) {
+      items = items.filter((i) => i.student_id === filters.studentId);
+    }
+    if (filters.eventType) {
+      items = items.filter((i) => i.event_type === filters.eventType);
+    }
+
+    // Sort descending by created_at
+    items.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+    if (filters.limit) {
+      items = items.slice(0, filters.limit);
+    }
+
+    return items;
+  }
+
+  getPendingCount(): number {
+    return Array.from(this.inMemoryQueue.values()).filter((i) => i.status === 'PENDING').length;
+  }
+
+  async getTodayStats(): Promise<TodayStats> {
+    const settings = await whatsappSettingsService.getSettings();
+    const today = new Date().toISOString().split('T')[0];
+
+    const items = Array.from(this.inMemoryQueue.values());
+    let sentToday = items.filter((i) => (i.status === 'SENT' || (i.status as string) === 'MOCK') && i.sent_at?.startsWith(today)).length;
+    let pending = items.filter((i) => i.status === 'PENDING').length;
+    let processing = items.filter((i) => i.status === 'PROCESSING').length;
+    let failedToday = items.filter((i) => i.status === 'FAILED' && i.updated_at.startsWith(today)).length;
+
+    let totalSentAllTime = items.filter((i) => i.status === 'SENT' || (i.status as string) === 'MOCK' || (i.status as string) === 'OK' || (i.status as string) === 'DELIVERED').length;
+    let monthSent = 0;
+    const now = new Date();
+    // Asia/Kolkata (IST = UTC + 5:30) date boundaries
+    const istOffsetMs = 5.5 * 60 * 60 * 1000;
+    const istNow = new Date(now.getTime() + istOffsetMs);
+    const istYear = istNow.getUTCFullYear();
+    const istMonth = istNow.getUTCMonth();
+    const istDate = istNow.getUTCDate();
+
+    // 00:00:00 IST to 23:59:59.999 IST converted to UTC ISO strings
+    const todayStart = new Date(Date.UTC(istYear, istMonth, istDate, 0, 0, 0) - istOffsetMs).toISOString();
+    const todayEnd = new Date(Date.UTC(istYear, istMonth, istDate, 23, 59, 59, 999) - istOffsetMs).toISOString();
+
+    const startOfMonth = new Date(Date.UTC(istYear, istMonth, 1, 0, 0, 0) - istOffsetMs).toISOString();
+    const lastDayOfMonth = new Date(Date.UTC(istYear, istMonth + 1, 0)).getUTCDate();
+    const endOfMonth = new Date(Date.UTC(istYear, istMonth, lastDayOfMonth, 23, 59, 59, 999) - istOffsetMs).toISOString();
+
+    const validStatuses = ['SENT', 'DELIVERED', 'MOCK', 'OK', 'SENT_NOW'];
+
+    if (this.supabase) {
+      try {
+        const [
+          { count: msgCount },
+          { count: queueCount },
+          { count: msgToday },
+          { count: queueToday },
+          { count: msgMonth },
+          { count: queueMonth },
+          { count: queuePending },
+          { count: queueProcessing },
+          { count: msgFailedToday },
+        ] = await Promise.all([
+          this.supabase
+            .from('whatsapp_messages')
+            .select('*', { count: 'exact', head: true })
+            .in('status', validStatuses),
+          this.supabase
+            .from('whatsapp_queue')
+            .select('*', { count: 'exact', head: true })
+            .in('status', ['SENT', 'MOCK', 'OK']),
+          this.supabase
+            .from('whatsapp_messages')
+            .select('*', { count: 'exact', head: true })
+            .in('status', validStatuses)
+            .gte('created_at', todayStart)
+            .lte('created_at', todayEnd),
+          this.supabase
+            .from('whatsapp_queue')
+            .select('*', { count: 'exact', head: true })
+            .in('status', ['SENT', 'MOCK', 'OK'])
+            .gte('updated_at', todayStart)
+            .lte('updated_at', todayEnd),
+          this.supabase
+            .from('whatsapp_messages')
+            .select('*', { count: 'exact', head: true })
+            .in('status', validStatuses)
+            .gte('created_at', startOfMonth)
+            .lte('created_at', endOfMonth),
+          this.supabase
+            .from('whatsapp_queue')
+            .select('*', { count: 'exact', head: true })
+            .in('status', ['SENT', 'MOCK', 'OK'])
+            .gte('updated_at', startOfMonth)
+            .lte('updated_at', endOfMonth),
+          this.supabase
+            .from('whatsapp_queue')
+            .select('*', { count: 'exact', head: true })
+            .eq('status', 'PENDING'),
+          this.supabase
+            .from('whatsapp_queue')
+            .select('*', { count: 'exact', head: true })
+            .eq('status', 'PROCESSING'),
+          this.supabase
+            .from('whatsapp_messages')
+            .select('*', { count: 'exact', head: true })
+            .eq('status', 'FAILED')
+            .gte('created_at', todayStart)
+            .lte('created_at', todayEnd),
+        ]);
+
+        totalSentAllTime = Math.max(totalSentAllTime, (msgCount || 0) + (queueCount && queueCount > (msgCount || 0) ? queueCount - (msgCount || 0) : 0), msgCount || 0);
+        sentToday = Math.max(sentToday, (msgToday || 0) + (queueToday && queueToday > (msgToday || 0) ? queueToday - (msgToday || 0) : 0), msgToday || 0);
+        monthSent = Math.max(msgMonth || 0, queueMonth || 0);
+        if (typeof queuePending === 'number') pending = Math.max(pending, queuePending);
+        if (typeof queueProcessing === 'number') processing = Math.max(processing, queueProcessing);
+        if (typeof msgFailedToday === 'number') failedToday = Math.max(failedToday, msgFailedToday);
+      } catch {
+        // Fallback to in-memory count
+      }
+    }
+
+    const startDay = String(new Date(now.getFullYear(), now.getMonth(), 1).getDate()).padStart(2, '0');
+    const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    const endDay = String(lastDay.getDate()).padStart(2, '0');
+    const monthStr = now.toLocaleDateString('en-IN', { month: 'short' });
+    const yearNum = now.getFullYear();
+    const billingPeriod = `${startDay} ${monthStr} ${yearNum} – ${endDay} ${monthStr} ${yearNum}`;
+    const ratePerMessage = 0.17;
+    const monthBilled = Number((monthSent * ratePerMessage).toFixed(2));
+
+    return {
+      sent: sentToday,
+      totalSent: totalSentAllTime,
+      monthSent,
+      pending,
+      processing,
+      failed: failedToday,
+      dailyLimit: settings.daily_limit,
+      remainingDailyLimit: Math.max(0, settings.daily_limit - sentToday),
+      ratePerMessage,
+      monthBilled,
+      billingPeriod,
+    };
+  }
+}
+
+export const queueService = new WhatsAppQueueService();
